@@ -1,0 +1,32 @@
+# Sensitive files - Never commit these!
+*.key
+*.csr
+*.crt
+*.pem
+*.ovpn
+keys/
+easy-rsa/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*~
+.*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-*
+
+# Generated files
+/etc/openvpn/
+/var/log/
