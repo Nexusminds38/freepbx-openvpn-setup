@@ -68,10 +68,27 @@ fi
 
 print_info "Main interface detected: $MAIN_INTERFACE"
 
-# Add NAT rules for VPN clients to access local network
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $MAIN_INTERFACE -j MASQUERADE
-iptables -A FORWARD -i tun0 -o $MAIN_INTERFACE -j ACCEPT
-iptables -A FORWARD -i $MAIN_INTERFACE -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+# Add NAT rules for VPN clients to access local network (check for duplicates first)
+if ! iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o $MAIN_INTERFACE -j MASQUERADE 2>/dev/null; then
+    print_info "Adding NAT masquerade rule..."
+    iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $MAIN_INTERFACE -j MASQUERADE
+else
+    print_info "NAT masquerade rule already exists"
+fi
+
+if ! iptables -C FORWARD -i tun0 -o $MAIN_INTERFACE -j ACCEPT 2>/dev/null; then
+    print_info "Adding FORWARD rule for tun0 to $MAIN_INTERFACE..."
+    iptables -A FORWARD -i tun0 -o $MAIN_INTERFACE -j ACCEPT
+else
+    print_info "FORWARD rule for tun0 to $MAIN_INTERFACE already exists"
+fi
+
+if ! iptables -C FORWARD -i $MAIN_INTERFACE -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+    print_info "Adding FORWARD rule for $MAIN_INTERFACE to tun0..."
+    iptables -A FORWARD -i $MAIN_INTERFACE -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+else
+    print_info "FORWARD rule for $MAIN_INTERFACE to tun0 already exists"
+fi
 
 # Install iptables-persistent to save rules
 if ! dpkg -l | grep -q iptables-persistent; then

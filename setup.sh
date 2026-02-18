@@ -94,32 +94,20 @@ chmod 600 /etc/openvpn/keys/server.key
 
 # Enable IP forwarding
 print_info "Enabling IP forwarding..."
-echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-sysctl -p
-
-# Configure firewall rules
-print_info "Configuring firewall rules..."
-# Allow OpenVPN through firewall
-ufw allow 1194/udp
-ufw allow OpenSSH
-
-# Determine the main network interface
-MAIN_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n 1)
-
-if [ -z "$MAIN_INTERFACE" ]; then
-    print_error "Could not determine main network interface"
-    exit 1
+if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    sysctl -p
+else
+    print_info "IP forwarding already enabled"
 fi
 
-print_info "Main interface detected: $MAIN_INTERFACE"
-
-# Setup NAT for VPN clients
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $MAIN_INTERFACE -j MASQUERADE
-iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT
-iptables -A FORWARD -d 10.8.0.0/24 -j ACCEPT
-
-# Save iptables rules
-iptables-save > /etc/iptables/rules.v4
+# Configure firewall rules - use the dedicated script
+print_info "Configuring firewall rules..."
+if [ -f "./configure-firewall.sh" ]; then
+    bash ./configure-firewall.sh
+else
+    print_warning "configure-firewall.sh not found. Please run it manually to configure firewall."
+fi
 
 # Enable and start OpenVPN service
 print_info "Enabling and starting OpenVPN service..."
