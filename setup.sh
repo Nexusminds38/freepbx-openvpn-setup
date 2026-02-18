@@ -103,8 +103,18 @@ print_info "Configuring firewall rules..."
 ufw allow 1194/udp
 ufw allow OpenSSH
 
+# Determine the main network interface
+MAIN_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n 1)
+
+if [ -z "$MAIN_INTERFACE" ]; then
+    print_error "Could not determine main network interface"
+    exit 1
+fi
+
+print_info "Main interface detected: $MAIN_INTERFACE"
+
 # Setup NAT for VPN clients
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $MAIN_INTERFACE -j MASQUERADE
 iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT
 iptables -A FORWARD -d 10.8.0.0/24 -j ACCEPT
 
@@ -119,16 +129,28 @@ systemctl start openvpn@server
 # Configure FreePBX extension admin0
 print_info "Configuring FreePBX extension admin0..."
 if [ -d "/etc/asterisk" ]; then
-    # Backup existing configuration
-    cp /etc/asterisk/pjsip.conf /etc/asterisk/pjsip.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-    
-    # Append admin0 extension to pjsip.conf
-    cat freepbx-extension-admin0.conf >> /etc/asterisk/pjsip.conf
-    
-    # Reload Asterisk configuration
-    asterisk -rx "pjsip reload"
-    
-    print_info "FreePBX extension admin0 configured successfully"
+    # Check if admin0 extension already exists
+    if grep -q "\[admin0\]" /etc/asterisk/pjsip.conf 2>/dev/null; then
+        print_warning "Extension admin0 already exists in pjsip.conf. Skipping configuration."
+    else
+        # Backup existing configuration
+        cp /etc/asterisk/pjsip.conf /etc/asterisk/pjsip.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+        
+        # Check if basic templates exist, if not add them
+        if ! grep -q "\[basic-endpoint\]" /etc/asterisk/pjsip.conf 2>/dev/null; then
+            print_info "Adding PJSIP templates to pjsip.conf..."
+            cat pjsip-templates.conf >> /etc/asterisk/pjsip.conf
+        fi
+        
+        # Append admin0 extension to pjsip.conf
+        cat freepbx-extension-admin0.conf >> /etc/asterisk/pjsip.conf
+        
+        # Reload Asterisk configuration
+        asterisk -rx "pjsip reload"
+        
+        print_info "FreePBX extension admin0 configured successfully"
+        print_warning "IMPORTANT: Change the default password in /etc/asterisk/pjsip.conf immediately!"
+    fi
 else
     print_warning "Asterisk directory not found. Please manually configure the extension."
 fi

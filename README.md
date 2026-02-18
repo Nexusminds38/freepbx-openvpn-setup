@@ -79,22 +79,22 @@ Key settings:
 - **Port**: 1194 (UDP)
 - **VPN Subnet**: 10.8.0.0/24
 - **Encryption**: SSL/TLS with certificate-based authentication
-- **Compression**: LZO compression enabled
+- **Compression**: lz4-v2 compression (modern OpenVPN 2.4+)
 - **Max Clients**: 100 concurrent connections
 
 ### FreePBX admin0 Extension
 
-**File**: `freepbx-extension-admin0.conf`
+**Files**: `freepbx-extension-admin0.conf` and `pjsip-templates.conf`
 
 Extension details:
 - **Extension Number**: 1000
 - **Caller ID**: "Admin" <1000>
-- **Type**: Friend (can make and receive calls)
+- **Type**: PJSIP endpoint with auth and AOR
 - **Codecs**: ulaw, alaw, gsm, g729
 - **Security**: Password-protected, SRTP media encryption
-- **Features**: Voicemail (mailbox 1000), BLF/presence support
+- **Features**: Voicemail (mailbox 1000), qualify enabled
 
-**Default Password**: `admin0Password123!` (Change this after setup!)
+**⚠️ SECURITY WARNING**: The default password is `admin0Password123!` - **CHANGE THIS IMMEDIATELY** after installation!
 
 ## Network Configuration
 
@@ -155,20 +155,33 @@ Configure your SIP client with:
 
 ### Changing the Extension Password
 
+⚠️ **CRITICAL SECURITY STEP** - Do this immediately after installation!
+
 1. Edit `/etc/asterisk/pjsip.conf`
-2. Find the `[admin0]` section
-3. Update the `secret=` line
+2. Find the `[admin0](basic-auth)` section
+3. Update the `password=` line with a strong password
 4. Reload Asterisk: `asterisk -rx "pjsip reload"`
+
+Example:
+```bash
+sudo nano /etc/asterisk/pjsip.conf
+# Change: password=admin0Password123!
+# To: password=YourStrongPassword123!@#
+sudo asterisk -rx "pjsip reload"
+```
 
 ## Security Recommendations
 
-1. **Change Default Password**: Update the admin0 extension password immediately
-2. **Use Strong Passwords**: Use complex passwords for all extensions
-3. **Enable SRTP**: Use encrypted media for sensitive calls
-4. **Regular Updates**: Keep OpenVPN and FreePBX updated
-5. **Monitor Logs**: Regularly check `/var/log/openvpn/` for suspicious activity
-6. **Client Revocation**: Revoke certificates for users who no longer need access
+1. **🔴 CRITICAL - Change Default Password**: Update the admin0 extension password **immediately** after installation
+2. **Use Strong Passwords**: Use complex passwords (20+ chars, mixed case, numbers, symbols) for all extensions
+3. **Enable SRTP**: Use encrypted media for all calls (already configured in admin0)
+4. **Regular Updates**: Keep OpenVPN and FreePBX updated with security patches
+5. **Monitor Logs**: Regularly check `/var/log/openvpn/` and `/var/log/asterisk/` for suspicious activity
+6. **Client Revocation**: Revoke VPN certificates for users who no longer need access
 7. **Firewall**: Keep firewall enabled and restrict access to necessary ports only
+8. **Limit Access**: Use VPN for remote access instead of exposing SIP directly to internet
+9. **Certificate Security**: Protect private keys with proper file permissions (600)
+10. **Fail2Ban**: Consider installing fail2ban to protect against brute-force attacks
 
 ## Troubleshooting
 
@@ -213,7 +226,8 @@ sudo sysctl -p
 freepbx-openvpn-setup/
 ├── README.md                      # This file
 ├── openvpn-server.conf           # OpenVPN server configuration
-├── freepbx-extension-admin0.conf # FreePBX admin0 extension config
+├── freepbx-extension-admin0.conf # FreePBX admin0 extension config (PJSIP)
+├── pjsip-templates.conf          # PJSIP templates for extensions
 ├── setup.sh                      # Main setup script
 ├── generate-client.sh            # Client certificate generator
 ├── configure-firewall.sh         # Firewall configuration script

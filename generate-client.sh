@@ -81,8 +81,8 @@ mute-replay-warnings
 # SSL/TLS parameters
 remote-cert-tls server
 
-# Enable compression
-comp-lzo
+# Enable compression (lz4-v2 is recommended for modern OpenVPN)
+compress lz4-v2
 
 # Set log file verbosity
 verb 3
