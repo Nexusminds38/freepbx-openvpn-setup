@@ -230,7 +230,14 @@ class HttpAdapter:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 payload = json.loads(resp.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Enformion API HTTP {exc.code}") from None
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace").strip()[:500]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Enformion API HTTP {exc.code}" + (f": {detail}" if detail else "")
+            ) from None
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Enformion API unreachable: {exc.reason}") from None
         return parse_response(payload, want_city=city, want_state=state)
