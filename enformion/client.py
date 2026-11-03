@@ -114,6 +114,85 @@ def _full_name(parts: dict) -> str:
     )
 
 
+def _live_full_name(name_obj) -> str:
+    """Join a live-shape (camelCase) name object into a full name."""
+    if not isinstance(name_obj, dict):
+        return ""
+    return " ".join(
+        str(name_obj.get(k, "")).strip()
+        for k in ("firstName", "middleName", "lastName")
+        if str(name_obj.get(k, "")).strip()
+    )
+
+
+def _parse_live_persons(payload: dict, want_city: str = "",
+                        want_state: str = "") -> list[PersonRecord]:
+    """Map a LIVE Enformion Person Search response into PersonRecords.
+
+    Live shape captured 2026-11-02 from the account's own ApiDemo (the
+    response the API actually returns — a camelCase envelope, NOT the
+    PascalCase layout in the portal's request docs): results under
+    "persons"; each person carries name{firstName, middleName, lastName},
+    age, locations[{city, state}], addresses[], phoneNumbers[] (the
+    subject's own — the packet contract keeps numbers on relatives, so
+    these are not mapped), relativesSummary[] / relatives[] and
+    associatesSummary[] / associates[] (identity only — a relative's
+    numbers require a follow-up Person Search on that relative).
+    """
+    records: list[PersonRecord] = []
+    for item in payload.get("persons") or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or {}
+        age = item.get("age")
+        if not isinstance(age, int) or isinstance(age, bool):
+            age = None
+
+        locations = [loc for loc in (item.get("locations") or [])
+                     if isinstance(loc, dict)]
+        chosen = None
+        for loc in locations:
+            if want_city and str(loc.get("city", "")).lower() == want_city.lower():
+                chosen = loc
+                break
+        if chosen is None and locations:
+            chosen = locations[0]
+        city = str(chosen.get("city", "")) if chosen else ""
+        state = str(chosen.get("state", "")) if chosen else ""
+        if not city:
+            for addr in item.get("addresses") or []:
+                if isinstance(addr, dict) and addr.get("city"):
+                    city = str(addr["city"])
+                    state = str(addr.get("state", ""))
+                    break
+
+        relatives: list[Relative] = []
+        seen: set[str] = set()
+
+        def _add(entries, relation: str) -> None:
+            for entry in entries or []:
+                if not isinstance(entry, dict):
+                    continue
+                rname = _live_full_name(entry.get("name") or entry)
+                if rname and rname.lower() not in seen:
+                    seen.add(rname.lower())
+                    relatives.append(Relative(name=rname, relation=relation,
+                                              phones=[]))
+
+        _add(item.get("relatives"), "relative")
+        _add(item.get("relativesSummary"), "relative")
+        _add(item.get("associates"), "associate")
+        _add(item.get("associatesSummary"), "associate")
+
+        records.append(PersonRecord(
+            first=str(name.get("firstName", "")),
+            last=str(name.get("lastName", "")),
+            age=age, city=city, state=state,
+            relatives=relatives,
+        ))
+    return records
+
+
 def parse_response(payload, want_city: str = "", want_state: str = "") -> list[PersonRecord]:
     """Map an Enformion Person Search response into PersonRecords.
 
@@ -125,6 +204,9 @@ def parse_response(payload, want_city: str = "", want_state: str = "") -> list[P
     a follow-up Person Search on that relative; see the survey file).
     Accepts a bare list of results or a dict wrapping one.
     """
+    if isinstance(payload, dict) and isinstance(payload.get("persons"), list):
+        return _parse_live_persons(payload, want_city=want_city,
+                                   want_state=want_state)
     if isinstance(payload, dict):
         results = None
         for key in ("Results", "Persons", "Matches", "SearchResults", "PersonSearchResults"):
@@ -196,8 +278,10 @@ class HttpAdapter:
     # Include tokens are written without spaces (docs' own example uses
     # "Addresses" / "PhoneNumbers"); includes are account-managed and the
     # rep can adjust them if a live call pushes back.
+    # LIVE-VERIFIED 2026-11-02: the "DateOfBirth" token makes the whole
+    # request fail HTTP 400; without it the identical call returns 200.
     INCLUDES = ["Addresses", "PhoneNumbers", "RelativesSummary",
-                "AssociatesSummary", "DateOfBirth"]
+                "AssociatesSummary"]
 
     def __init__(self) -> None:
         self._name, self._password = load_credentials()
