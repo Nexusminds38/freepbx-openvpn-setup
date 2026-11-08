@@ -142,6 +142,61 @@ Re-ingestion of the same episode cannot move that deadline later, including when
 The inventory reports paths, kinds, sizes, and raw `expires_at` values. It
 does not copy record bodies into the report. `would_delete` is false.
 
+### Synthetic cleanup
+
+`cleanup.plan_cleanup` counts expired, retained, missing, malformed, and
+ambiguous records and deletes nothing. `cleanup.apply_synthetic_cleanup`
+also deletes nothing unless `apply=True` and `confirm="synthetic-test-store"`.
+Apply additionally requires an explicit `explicit_expires_at` policy with no
+duration field and a `synthetic-store.json` marker. `mark_synthetic_store`
+writes that marker only into an empty directory, so an existing store cannot
+be labeled after the fact. The marker has no episode, name, or deadline.
+
+Records for one episode are deleted only when every deadline on that episode
+is the same timezone-aware instant and that instant is at or before the
+supplied clock. Differing deadlines block the episode. Hardlinks and symlinks
+block the whole cleanup. An untied identifying sidecar or an unclassified
+file also blocks the cleanup instead of being skipped.
+
+A record is removable only when every copy of its episode has one
+timezone-aware deadline and the earliest instant is less than or equal to
+the supplied clock. The same instant expressed with a numeric offset is the
+same deadline. A missing, naive, or unreadable deadline blocks that episode
+and is counted without deleting it. A log line with no episode id is left
+in place. Lines for a different, still-unexpired episode in the same log or
+backup are left in place. An identifying sidecar is removed only when its
+filename matches exactly one expired episode; an untied sidecar is counted
+and kept. Symlinks and paths that leave the store block the whole cleanup.
+No identifying tombstone or hash is written. A partial failure stops further
+deletes.
+
+Unknown or malformed deadlines block live linkage. The cleanup report sets
+`retention_compliance_claimed` false. Fixture cleanup does not prove that
+any production store was deleted. Out of scope: unmarked directories, the
+historical hidden records path, `/home/box` clients, Bookings, the 5-county
+monitor, Roster-watch, provider retention, chat transcripts, and platform
+or disk snapshots.
+
+## Deployment readiness
+
+Code in this lane:
+
+- Default workflow stays mock-only. Live lookup, relative search, and
+  credential reads refuse.
+- `production_destination` stays unset. `live_linkage` stays blocked.
+- Supplied-identifier consistency does not claim identity proof.
+- Synthetic cleanup can remove expired fixture artifacts under an explicit
+  deadline when the caller opts in.
+
+Still required before any operational use:
+
+- An owner-confirmed retention duration. None is configured here.
+- A decision on the production destination. None is wired.
+- A real-store inventory and an authorized deletion run against that store,
+  including backups and copies outside this repository.
+- Confirmation that chat, platform, and provider copies are in scope or
+  explicitly excluded. This code does not reach them.
+
 ### What is still required to prove operational deletion
 
 A passing mock test does not prove deletion. Proving it requires an
@@ -156,7 +211,7 @@ identifying-hash sidecar remains. This branch does not run that procedure.
 From `enformion/`:
 
 ```bash
-python3 -m unittest tests.test_offline_acceptance -v
+python3 -W error::ResourceWarning -m unittest tests.test_offline_acceptance tests.test_synthetic_cleanup -v
 ```
 
 The suite uses fictional identifiers, denies sockets and HTTP, and does not
@@ -171,11 +226,13 @@ is required.
 - `handoff.py` — synthetic handoff contract and episode key.
 - `receiver.py` — offline receiver.
 - `retention.py` — deadline rules, authorization, dry-run inventory.
+- `cleanup.py` — dry-run by default; explicit synthetic-store cleanup.
 - `audit.py` — optional offline copy when authorization succeeds.
 - `research_log.py` — read a configured directory; do not create the default store.
 - `relative_phones.py` — disabled entry points.
 - `dormant_discovery.py` — refusal boundary, not imported by the default path.
 - `tests/test_offline_acceptance.py` — offline acceptance tests.
+- `tests/test_synthetic_cleanup.py` — synthetic cleanup and handoff smoke test.
 
 ## Still disconnected
 
