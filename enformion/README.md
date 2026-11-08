@@ -123,6 +123,8 @@ No identifying hash is written.
 
 Live linkage remains `blocked` after an authorized offline copy.
 
+Re-ingestion of the same episode cannot move that deadline later, including when a new timestamp is an earlier calendar string but a later instant. A shorter deadline is written onto the packet, the result, and every stored log or backup line for that episode. A naive or invalid deadline already on disk blocks the write; a timezone is not invented for it, and the bytes are not deleted. The records directory, a path that resolves through a symlink, and any symlink inside the directory are not followed. An identifying-hash sidecar blocks a new write and is left in place for the dry-run inventory.
+
 ### Artifact inventory
 
 `retention.dry_run_deletion` lists files and deletes nothing. The catalog is:

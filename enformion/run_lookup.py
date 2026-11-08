@@ -17,6 +17,7 @@ from datetime import datetime
 import client
 import handoff
 import receiver
+import retention
 import verify
 
 
@@ -95,6 +96,10 @@ def prepare_offline(
         now=now or datetime.now(observed_at.tzinfo),
         records_directory=records_directory,
     )
+    if receipt.get("persisted") and receipt.get("expires_at"):
+        packet = retention.rewrite_expires_at(packet, receipt["expires_at"])
+    elif not receipt.get("persisted") and "lengthen" in str(receipt.get("reason") or ""):
+        packet = retention.without_expires_at(packet)
     return {
         "workflow": "disconnected_mock",
         "consistency": decision.as_dict(),

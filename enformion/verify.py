@@ -109,7 +109,14 @@ def _decision(
     )
 
 
-def _missing_supplied(first: object, last: object, city: object, state: object, age: object) -> list[str]:
+def _missing_supplied(
+    first: object,
+    last: object,
+    city: object,
+    state: object,
+    age: object,
+    phone: str | None = None,
+) -> list[str]:
     missing: list[str] = []
     if not _norm(first):
         missing.append("first")
@@ -121,6 +128,8 @@ def _missing_supplied(first: object, last: object, city: object, state: object, 
         missing.append("state")
     if isinstance(age, bool) or not isinstance(age, int):
         missing.append("age")
+    if phone is not None and str(phone).strip() != "" and not _digits(phone):
+        missing.append("contact")
     return missing
 
 
@@ -161,7 +170,7 @@ def check_consistency(
                 0,
             )
 
-    missing = _missing_supplied(first, last, city, state, age)
+    missing = _missing_supplied(first, last, city, state, age, phone)
     if missing:
         return _decision(
             STATUS_MISSING_IDENTIFIER,

@@ -555,6 +555,213 @@ class OfflineAcceptanceTests(unittest.TestCase):
             self.assertNotIn("555-0100", combined)
             self.assertIn("results/relative-phones.json", persisted)
 
+    def test_reingest_cannot_extend_deadlines_and_shorter_rewrites_derivatives(self) -> None:
+        original = "2026-11-18T00:00:00+00:00"
+        with tempfile.TemporaryDirectory() as tmp:
+            first = prepare(
+                policy=POLICY,
+                expires_at=original,
+                records_directory=tmp,
+                now=NOW,
+            )
+            self.assertTrue(first["receipt"]["persisted"])
+            episode = first["handoff"]["episode"]["episode_id"]
+            backup = os.path.join(tmp, "backups", "research-log.jsonl.bak")
+            self._write(
+                backup,
+                json.dumps({"episode_id": episode, "expires_at": original}) + "\n",
+            )
+            before = self._snapshot(tmp)
+            later_instant = "2026-11-17T21:00:00-05:00"
+            extended = prepare(
+                policy=POLICY,
+                expires_at=later_instant,
+                records_directory=tmp,
+                now=NOW,
+            )
+            self.assertFalse(extended["receipt"]["persisted"])
+            self.assertIn("lengthen", extended["receipt"]["reason"])
+            self.assertEqual(self._snapshot(tmp), before)
+            self.assertNotIn(later_instant, json.dumps(extended["handoff"]))
+            logged = audit.log_event(
+                policy=POLICY,
+                expires_at="2026-11-25T00:00:00+00:00",
+                directory=tmp,
+                now=NOW,
+                episode_id=episode,
+                outcome="candidate_consistent",
+            )
+            self.assertFalse(logged["persisted"])
+            self.assertEqual(self._snapshot(tmp), before)
+
+            shortened = prepare(
+                policy=POLICY,
+                expires_at="2026-11-16T00:00:00+00:00",
+                records_directory=tmp,
+                now=NOW,
+            )
+            self.assertTrue(shortened["receipt"]["persisted"])
+            self.assertEqual(shortened["receipt"]["expires_at"], "2026-11-16T00:00:00+00:00")
+            for name in ("log", "queue", "output", "packet"):
+                self.assertEqual(
+                    shortened["receipt"]["derivatives"][name]["expires_at"],
+                    "2026-11-16T00:00:00+00:00",
+                )
+            combined = "\n".join(text.decode() for text in self._snapshot(tmp).values())
+            self.assertNotIn(original, combined)
+            self.assertNotIn("2026-11-25", combined)
+            self.assertIn("2026-11-16T00:00:00+00:00", combined)
+            self.assertIn("2026-11-16T00:00:00+00:00", self._snapshot(tmp)["backups/research-log.jsonl.bak"].decode())
+
+    def test_intermediate_packet_deadline_is_not_stored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = prepare(expires_at="2026-11-20T00:00:00+00:00", policy=None)
+            packet = json.loads(json.dumps(base["handoff"]))
+            packet["output_copy"] = {"expires_at": "2026-11-19T12:00:00+00:00"}
+            packet["queue_copy"] = {"expires_at": "2026-11-19T00:00:00+00:00"}
+            receipt = receiver.receive(packet, policy=POLICY, now=NOW, records_directory=tmp)
+            self.assertTrue(receipt["persisted"])
+            self.assertEqual(receipt["expires_at"], "2026-11-19T00:00:00+00:00")
+            combined = "\n".join(text.decode() for text in self._snapshot(tmp).values())
+            self.assertNotIn("2026-11-19T12:00:00+00:00", combined)
+            self.assertNotIn("2026-11-20T00:00:00+00:00", combined)
+            self.assertIn("2026-11-19T00:00:00+00:00", combined)
+
+    def test_naive_stored_deadline_blocks_rewrite_without_inferring_timezone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first = prepare(policy=POLICY, expires_at=EXPIRES, records_directory=tmp, now=NOW)
+            episode = first["handoff"]["episode"]["episode_id"]
+            naive_line = json.dumps({"episode_id": episode, "expires_at": "2026-12-01T00:00:00"}) + "\n"
+            path = os.path.join(tmp, "query-log.jsonl")
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(naive_line)
+            before = self._snapshot(tmp)
+            again = prepare(policy=POLICY, expires_at="2026-11-19T00:00:00+00:00", records_directory=tmp, now=NOW)
+            self.assertFalse(again["receipt"]["persisted"])
+            self.assertIn("timezone", again["receipt"]["reason"])
+            self.assertEqual(self._snapshot(tmp), before)
+            self.assertIn("2026-12-01T00:00:00", before["query-log.jsonl"].decode())
+            self.assertNotIn("2026-12-01T00:00:00+00:00", before["query-log.jsonl"].decode())
+
+    def test_symlinks_are_not_followed_for_writes_or_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as root:
+            outside_log = os.path.join(outside, "research-log.jsonl")
+            self._write(outside_log, "OUTSIDE-MARKER\n")
+            link = os.path.join(root, "research-log.jsonl")
+            os.symlink(outside_log, link)
+            blocked = audit.log_event(
+                policy=POLICY,
+                expires_at=EXPIRES,
+                directory=root,
+                now=NOW,
+                episode_id="episode-symlink",
+                outcome="candidate_consistent",
+            )
+            self.assertFalse(blocked["persisted"])
+            with open(outside_log, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "OUTSIDE-MARKER\n")
+            report = retention.dry_run_deletion(root, now=NOW, policy=None)
+            self.assertFalse(report["symlinks_followed"])
+            self.assertFalse(report["real_deletion_performed"])
+            blob = json.dumps(report)
+            self.assertNotIn("OUTSIDE-MARKER", blob)
+            listed = [item for item in report["artifacts"] if item["relative_path"] == "research-log.jsonl"]
+            self.assertEqual(len(listed), 1)
+            self.assertTrue(listed[0]["symlink"])
+            self.assertFalse(listed[0]["followed"])
+            self.assertTrue(listed[0]["escapes_root"])
+            self.assertTrue(os.path.islink(link))
+
+            hidden = os.path.join(outside, "hidden.json")
+            self._write(hidden, '{"note":"HIDDEN-SYMLINK-TARGET","expires_at":"2026-11-19T00:00:00+00:00"}\n')
+            os.symlink(outside, os.path.join(root, "escape"))
+            scanned = retention.inventory_artifacts(root)
+            scanned_blob = json.dumps(scanned)
+            self.assertNotIn("HIDDEN-SYMLINK-TARGET", scanned_blob)
+            escape = [item for item in scanned["artifacts"] if item["relative_path"] == "escape"]
+            self.assertEqual(len(escape), 1)
+            self.assertTrue(escape[0]["symlink_directory"])
+            self.assertFalse(escape[0]["followed"])
+            self.assertNotIn("escape/hidden.json", {item["relative_path"] for item in scanned["artifacts"]})
+
+    def test_hash_sidecar_is_inventoried_and_blocks_new_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = os.path.join(tmp, "results", "episode.sha256")
+            self._write(sidecar, "HASH-CANARY\n")
+            report = retention.dry_run_deletion(tmp, now=NOW, policy=POLICY)
+            self.assertIn("identifying_hash_sidecar", report["kinds_found"])
+            self.assertNotIn("HASH-CANARY", json.dumps(report))
+            with open(sidecar, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "HASH-CANARY\n")
+            blocked = prepare(policy=POLICY, expires_at=EXPIRES, records_directory=tmp, now=NOW)
+            self.assertFalse(blocked["receipt"]["persisted"])
+            self.assertIn("hash", blocked["receipt"]["reason"])
+            with open(sidecar, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "HASH-CANARY\n")
+            self.assertEqual(self._snapshot(tmp), {"results/episode.sha256": b"HASH-CANARY\n"})
+
+    def test_inventory_deadline_comparison_uses_instants_not_string_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(
+                os.path.join(tmp, "research-log.jsonl"),
+                "\n".join([
+                    '{"episode_id":"ep","expires_at":"2026-11-20T00:00:00+00:00"}',
+                    '{"episode_id":"ep","expires_at":"2026-11-19T20:00:00-05:00"}',
+                    '{"episode_id":"ep","expires_at":"2026-11-18T00:00:00"}',
+                ]) + "\n",
+            )
+            report = retention.inventory_artifacts(tmp)
+            listed = report["artifacts"][0]
+            self.assertEqual(listed["expires_at_raw"], "2026-11-20T00:00:00+00:00")
+            self.assertIn("2026-11-18T00:00:00", listed["expires_at_unparsed"])
+            self.assertNotIn("2026-11-19T20:00:00-05:00", listed["expires_at_unparsed"])
+
+    def test_non_digit_contact_and_certainty_claims_do_not_export(self) -> None:
+        decision = verify.check_consistency(
+            [person(relatives=[client.Relative("Riley Exampleton", "relative", [client.Phone("555-0100")])])],
+            first="Casey",
+            last="Exampleton",
+            city="Exampleville",
+            state="EX",
+            age=40,
+            phone="not-a-number",
+        )
+        self.assertEqual(decision.status, "missing_identifier")
+        self.assertIn("contact", decision.reason)
+        self.assertFalse(decision.identity_proof)
+        self.assertFalse(decision.verified_export)
+        self.assertIsNone(decision.candidate)
+        self.assertNotIn("Riley", json.dumps(decision.as_dict()))
+
+        decoys = prepare(candidates=None)
+        self.assertEqual(decoys["consistency"]["status"], "candidate_consistent")
+        self.assertFalse(decoys["consistency"]["identity_proof"])
+        self.assertFalse(decoys["consistency"]["verified_export"])
+        self.assertNotIn("Riley", json.dumps(decoys))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = prepare(expires_at=EXPIRES, policy=None)
+            claimed = json.loads(json.dumps(base["handoff"]))
+            claimed["consistency"]["identity_proof"] = True
+            claimed["consistency"]["status"] = "VERIFIED"
+            claimed["relatives"] = [{"name": "Riley Exampleton", "phones": ["555-0100"]}]
+            receipt = receiver.receive(claimed, policy=POLICY, now=NOW, records_directory=tmp)
+            self.assertFalse(receipt["persisted"])
+            self.assertFalse(receipt["accepted_offline"])
+            self.assertEqual(os.listdir(tmp), [])
+
+            smuggled = json.loads(json.dumps(base["handoff"]))
+            smuggled["relatives"] = [{"name": "Riley Exampleton"}]
+            smuggled["consistency"]["emergency_contacts"] = ["555-0199"]
+            stored = receiver.receive(smuggled, policy=POLICY, now=NOW, records_directory=tmp)
+            self.assertTrue(stored["persisted"])
+            combined = "\n".join(text.decode() for text in self._snapshot(tmp).values())
+            self.assertNotIn("Riley", combined)
+            self.assertNotIn("555-0199", combined)
+            self.assertNotIn("555-0100", combined)
+            self.assertIn('"identity_proof": false', combined)
+            self.assertIn('"verified_export": false', combined)
+
     def test_credentials_and_user_config_are_not_read(self) -> None:
         with patch("os.path.expanduser", side_effect=AssertionError("expanduser")), patch("builtins.open", side_effect=AssertionError("open")):
             with self.assertRaises(client.LiveLookupDisabled):

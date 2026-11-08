@@ -41,24 +41,24 @@ def _require_offline(packet: dict) -> None:
         raise ReceiverError("episode id is required")
 
 
-def _expires_values(node: object) -> list[str]:
-    found: list[str] = []
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key == "expires_at" and isinstance(value, str):
-                found.append(value)
-            else:
-                found.extend(_expires_values(value))
-    elif isinstance(node, list):
-        for item in node:
-            found.extend(_expires_values(item))
-    return found
+def _certainty_claim(packet: dict) -> str | None:
+    consistency = packet.get("consistency")
+    if not isinstance(consistency, dict):
+        return None
+    if consistency.get("identity_proof") not in (False, None):
+        return "packet claims identity proof; refusing to store it as certainty"
+    if consistency.get("verified_export") not in (False, None):
+        return "packet claims a verified export; refusing to store it"
+    status = str(consistency.get("status", "")).replace(" ", "").casefold()
+    if status in {"verified", "identity_proven", "identityproof"}:
+        return "packet status claims identity certainty; refusing to store it"
+    return None
 
 
 def _reconcile_deadlines(packet: dict, *, now: datetime) -> tuple[datetime, dict]:
     """Keep the earliest deadline and reject any deadline that lengthens it."""
     original = retention.parse_expires_at(packet.get("expires_at"), now=now)
-    parsed = [retention.parse_expires_at(value, now=now) for value in _expires_values(packet)]
+    parsed = [retention.parse_expires_at(value, now=now) for value in retention.iter_expires_at(packet)]
     for deadline in parsed:
         if deadline > original:
             raise retention.RetentionRejected(
@@ -80,6 +80,17 @@ def receive(
 ) -> dict:
     """Accept one offline packet. Persistence and live linkage follow policy."""
     _require_offline(packet)
+    claim = _certainty_claim(packet)
+    if claim:
+        return {
+            "accepted_offline": False,
+            "persisted": False,
+            "live_linkage": "blocked",
+            "production_destination": None,
+            "reason": claim,
+            "expires_at": None,
+            "synthetic": True,
+        }
     auth = retention.authorize(policy, packet.get("expires_at"), now=now)
     receipt = {
         "accepted_offline": True,
@@ -106,9 +117,19 @@ def receive(
             "records directory is not configured; persistence blocked; live linkage blocked"
         )
         return receipt
-    stored = audit.persist_bundle(records_directory, packet, earliest)
-    receipt["persisted"] = stored["persisted"]
+    stored = audit.persist_bundle(records_directory, packet, earliest, now=now)
+    if not stored.get("persisted"):
+        receipt["accepted_offline"] = False
+        receipt["persisted"] = False
+        receipt["expires_at"] = None
+        receipt.pop("derivatives", None)
+        receipt["reason"] = stored.get("reason")
+        return receipt
+    stored_deadline = retention.parse_expires_at(stored.get("expires_at"), now=now)
+    receipt["persisted"] = True
     receipt["live_linkage"] = "blocked"
+    receipt["expires_at"] = stored_deadline.isoformat()
+    receipt["derivatives"] = retention.stamp_derivatives(stored_deadline)
     receipt["reason"] = (
         "offline copy stored under the earliest deadline; live linkage remains blocked"
     )

@@ -59,15 +59,32 @@ PERSISTED_ARTIFACT_CATALOG = (
         "kind": "backup",
         "where": "backups/ and .bak or .backup copies",
     },
+    {
+        "kind": "queue",
+        "where": "queue.jsonl and files under queue/",
+    },
+    {
+        "kind": "identifying_hash_sidecar",
+        "where": "sha256 or .hash sidecars beside research records",
+    },
 )
 
 _CONTACT_KEYS = {
     "relatives",
+    "relative",
+    "relativesSummary",
+    "relatives_summary",
     "phones",
     "phone",
+    "phoneNumber",
     "phoneNumbers",
     "phone_numbers",
+    "numbers",
+    "contacts",
+    "emergency_contacts",
     "associates",
+    "associatesSummary",
+    "associates_summary",
     "subject_phones",
     "sha256",
     "result_sha256",
@@ -258,56 +275,227 @@ def redact_identifying_contacts(value: object) -> object:
     return value
 
 
+def try_aware_deadline(value: object) -> datetime | None:
+    """Parse a deadline for comparison. Naive and invalid values return None.
+
+    This does not treat a missing timezone as UTC.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return None
+    return parsed
+
+
+def iter_expires_at(node: object) -> list[str]:
+    """Collect raw ``expires_at`` strings from a JSON-like tree."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "expires_at" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(iter_expires_at(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(iter_expires_at(item))
+    return found
+
+
+def without_expires_at(node: object) -> object:
+    """Drop every deadline field so a rejected proposal cannot be re-stored."""
+    if isinstance(node, dict):
+        return {
+            key: without_expires_at(value)
+            for key, value in node.items()
+            if key != "expires_at"
+        }
+    if isinstance(node, list):
+        return [without_expires_at(item) for item in node]
+    return node
+
+
+def rewrite_expires_at(node: object, deadline: str) -> object:
+    """Return a copy whose every ``expires_at`` string is ``deadline``."""
+    if isinstance(node, dict):
+        rewritten = {}
+        for key, value in node.items():
+            if key == "expires_at":
+                rewritten[key] = deadline
+            else:
+                rewritten[key] = rewrite_expires_at(value, deadline)
+        return rewritten
+    if isinstance(node, list):
+        return [rewrite_expires_at(item, deadline) for item in node]
+    return node
+
+
+def mentions_episode(node: object, episode_id: str) -> bool:
+    if not episode_id or not isinstance(node, dict):
+        return False
+    if node.get("episode_id") == episode_id:
+        return True
+    episode = node.get("episode")
+    return isinstance(episode, dict) and episode.get("episode_id") == episode_id
+
+
+def resolve_episode_deadline(
+    proposed: object,
+    stored: list[object],
+    *,
+    now: datetime,
+    packet_deadlines: list[object] | None = None,
+) -> datetime:
+    """Return the earliest deadline, or reject a lengthening re-ingest.
+
+    A proposal later than a deadline already stored for the episode is an
+    extension and raises. A shorter proposal becomes the earliest. Naive or
+    invalid stored values raise so a timezone is not invented and the bytes
+    are left untouched. This function does not choose a retention duration.
+    """
+    proposed_dt = parse_expires_at(proposed, now=now)
+    stored_dts: list[datetime] = []
+    for value in stored:
+        parsed = try_aware_deadline(value)
+        if parsed is None:
+            raise RetentionRejected(
+                "stored deadline is missing a timezone or is invalid; "
+                "refusing to infer one, extend retention, or rewrite the record"
+            )
+        if parsed <= now:
+            raise RetentionRejected(
+                "stored deadline is expired; refusing to extend, reset, or rewrite it"
+            )
+        stored_dts.append(parsed)
+    packet_dts: list[datetime] = []
+    for value in packet_deadlines or []:
+        parsed = parse_expires_at(value, now=now)
+        packet_dts.append(parsed)
+    if stored_dts:
+        stored_earliest = min(stored_dts)
+        if proposed_dt > stored_earliest:
+            raise RetentionRejected(
+                "deadline extension or reset would lengthen retention "
+                "beyond the stored earliest deadline"
+            )
+        for item in packet_dts:
+            if item > stored_earliest:
+                raise RetentionRejected(
+                    "packet deadline would lengthen retention beyond the stored earliest deadline"
+                )
+        earliest = stored_earliest
+        if proposed_dt < earliest:
+            earliest = proposed_dt
+        for item in packet_dts:
+            if item < earliest:
+                earliest = item
+        return earliest
+    earliest = proposed_dt
+    for item in packet_dts:
+        if item < earliest:
+            earliest = item
+    return earliest
+
+
+def _is_hash_sidecar(base: str) -> bool:
+    folded = base.casefold()
+    return (
+        folded.endswith(".sha256")
+        or folded.endswith(".hash")
+        or "sha256" in folded
+        or "identifying_hash" in folded
+        or "identifying-hash" in folded
+    )
+
+
 def classify_artifact(relative_path: str) -> list[str]:
     """Return catalog kinds that apply to one relative path."""
     rel = relative_path.replace("\\", "/")
     base = os.path.basename(rel)
-    lower = rel.lower()
+    folded = base.casefold()
+    lower = rel.casefold()
+    parent = os.path.basename(os.path.dirname(rel)).casefold()
     kinds: list[str] = []
 
     def add(kind: str) -> None:
         if kind not in kinds:
             kinds.append(kind)
 
-    if base == "query-log.jsonl" or base.endswith(".query.jsonl"):
+    if folded in {"query-log.jsonl", "query_log.jsonl"} or folded.endswith(".query.jsonl"):
         add("query_log")
-    if base == "audit-events.jsonl" or "audit" in base:
+    if folded in {"audit-events.jsonl", "audit_events.jsonl"} or "audit" in folded:
         add("audit_log")
-    if base == "research-log.jsonl" or base.startswith("research-log"):
+    if folded.startswith("research-log") or folded.startswith("research_log"):
         add("research_log")
         add("audit_log")
-    parent = os.path.basename(os.path.dirname(rel))
-    if parent == "results" and base.endswith(".json") and "relative" not in base:
+    if parent == "results" and folded.endswith(".json") and "relative" not in folded:
         add("saved_result_json")
-    if "relative" in base and base.endswith(".json"):
+    if "relative" in folded and folded.endswith(".json"):
         add("relative_output")
     if (
-        base.startswith("handoff")
+        folded.startswith("handoff")
         or "/packets/" in f"/{lower}/"
         or parent == "packets"
     ):
         add("handoff_packet")
     if (
-        base.endswith(".bak")
-        or base.endswith(".backup")
+        folded.endswith(".bak")
+        or folded.endswith(".backup")
         or parent in {"backup", "backups"}
         or "/backups/" in f"/{lower}/"
         or "/backup/" in f"/{lower}/"
     ):
         add("backup")
+    if parent == "queue" or folded in {"queue.jsonl", "queue.json"} or "/queue/" in f"/{lower}/":
+        add("queue")
+    if _is_hash_sidecar(base):
+        add("identifying_hash_sidecar")
     return kinds
 
 
-def _expires_raw(path: str) -> str | None:
+def _deadline_observation(values: list[str]) -> dict:
+    """Pick the earliest timezone-aware instant. Do not sort the raw strings.
+
+    Naive and invalid values stay in ``expires_at_unparsed`` and are not
+    treated as UTC.
+    """
+    winner_raw = None
+    winner_dt = None
+    unparsed: list[str] = []
+    for value in values:
+        parsed = try_aware_deadline(value)
+        if parsed is None:
+            unparsed.append(value)
+            continue
+        if winner_dt is None or parsed < winner_dt:
+            winner_dt = parsed
+            winner_raw = value
+    return {
+        "expires_at_raw": winner_raw,
+        "expires_at_unparsed": unparsed,
+    }
+
+
+def _expires_in_file(path: str) -> dict:
+    values: list[str] = []
     try:
         if path.endswith(".json"):
             with open(path, encoding="utf-8") as handle:
                 data = json.load(handle)
-            if isinstance(data, dict) and isinstance(data.get("expires_at"), str):
-                return data["expires_at"]
-            return None
-        if path.endswith(".jsonl"):
-            seen: list[str] = []
+            values = iter_expires_at(data)
+        elif path.endswith(".jsonl"):
             with open(path, encoding="utf-8") as handle:
                 for line in handle:
                     line = line.strip()
@@ -316,52 +504,76 @@ def _expires_raw(path: str) -> str | None:
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
+                        values.append(line)
                         continue
-                    if isinstance(data, dict) and isinstance(data.get("expires_at"), str):
-                        seen.append(data["expires_at"])
-            return min(seen) if seen else None
+                    values.extend(iter_expires_at(data))
+    except (OSError, json.JSONDecodeError):
+        return {"expires_at_raw": None, "expires_at_unparsed": []}
+    return _deadline_observation(values)
+
+
+def _escapes_root(root: str, path: str) -> bool:
+    root_real = os.path.realpath(root)
+    try:
+        target = os.path.realpath(path)
     except OSError:
-        return None
-    return None
+        return True
+    try:
+        common = os.path.commonpath([root_real, target])
+    except ValueError:
+        return True
+    return common != root_real
+
+
+def _artifact_record(root: str, path: str, *, symlink: bool, directory: bool = False) -> dict:
+    relative = os.path.relpath(path, root)
+    record = {
+        "relative_path": relative,
+        "kinds": classify_artifact(relative) or ["unclassified"],
+        "bytes": None,
+        "expires_at_raw": None,
+        "expires_at_unparsed": [],
+        "would_delete": False,
+        "symlink": symlink,
+        "symlink_directory": directory and symlink,
+        "followed": False,
+        "escapes_root": _escapes_root(root, path) if symlink else False,
+    }
+    if symlink:
+        return record
+    try:
+        record["bytes"] = os.path.getsize(path)
+    except OSError:
+        record["bytes"] = None
+    observed = _expires_in_file(path)
+    record["expires_at_raw"] = observed["expires_at_raw"]
+    record["expires_at_unparsed"] = observed["expires_at_unparsed"]
+    return record
 
 
 def inventory_artifacts(root: str) -> dict:
-    """Inventory files under ``root`` without deleting or copying contacts."""
+    """Inventory files under ``root`` without deleting or copying contacts.
+
+    Symlinks are listed and not followed, so a directory symlink cannot hide
+    a target tree inside a claim that the scan was complete.
+    """
     found: list[dict] = []
     root = os.path.abspath(root)
-    if os.path.isdir(root):
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames.sort()
-            for name in sorted(filenames):
+    if os.path.islink(root):
+        found.append(_artifact_record(os.path.dirname(root) or "/", root, symlink=True, directory=True))
+    elif os.path.isdir(root):
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            real_dirs = []
+            for name in sorted(dirnames):
                 path = os.path.join(dirpath, name)
                 if os.path.islink(path):
-                    relative = os.path.relpath(path, root)
-                    found.append(
-                        {
-                            "relative_path": relative,
-                            "kinds": classify_artifact(relative) or ["unclassified"],
-                            "bytes": None,
-                            "expires_at_raw": None,
-                            "would_delete": False,
-                            "symlink": True,
-                        }
-                    )
+                    found.append(_artifact_record(root, path, symlink=True, directory=True))
                     continue
-                relative = os.path.relpath(path, root)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    size = None
-                found.append(
-                    {
-                        "relative_path": relative,
-                        "kinds": classify_artifact(relative) or ["unclassified"],
-                        "bytes": size,
-                        "expires_at_raw": _expires_raw(path),
-                        "would_delete": False,
-                        "symlink": False,
-                    }
-                )
+                real_dirs.append(name)
+            dirnames[:] = real_dirs
+            for name in sorted(filenames):
+                path = os.path.join(dirpath, name)
+                found.append(_artifact_record(root, path, symlink=os.path.islink(path)))
     kinds_found = sorted({kind for item in found for kind in item["kinds"]})
     catalog_kinds = [item["kind"] for item in PERSISTED_ARTIFACT_CATALOG]
     return {
@@ -370,7 +582,12 @@ def inventory_artifacts(root: str) -> dict:
         "artifacts": found,
         "kinds_found": kinds_found,
         "kinds_absent": [kind for kind in catalog_kinds if kind not in kinds_found],
+        "symlinks_followed": False,
         "real_deletion_performed": False,
+        "inventory_note": (
+            "Symlink files and symlink directories are listed and not opened. "
+            "Their targets are outside this inventory."
+        ),
     }
 
 
