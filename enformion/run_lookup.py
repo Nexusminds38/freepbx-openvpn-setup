@@ -45,6 +45,7 @@ def prepare_offline(
     booking_reference: str,
     observed_at: datetime,
     first_seen_at: datetime,
+    first_collected_at: datetime | None = None,
     source_timestamp_raw: str | None = None,
     source_timezone: str | None = None,
     candidates: list | None = None,
@@ -80,6 +81,7 @@ def prepare_offline(
         first_seen_at=first_seen_at,
         source_timestamp_raw=source_timestamp_raw,
         source_timezone=source_timezone,
+        first_collected_at=first_collected_at,
         supplied_identifiers={
             "first": first,
             "last": last,
@@ -113,8 +115,10 @@ def _policy_from_arg(value: str) -> dict | None:
         return None
     if value == "explicit_expires_at":
         return {"mode": "explicit_expires_at"}
+    if value == "owner_first_collection_plus_23h":
+        return {"mode": "owner_first_collection_plus_23h"}
     raise handoff.HandoffError(
-        "retention policy must be explicit_expires_at; this lane does not accept a duration"
+        "retention policy must be explicit_expires_at or owner_first_collection_plus_23h"
     )
 
 
@@ -132,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--booking-ref", required=True)
     parser.add_argument("--observed-at", required=True)
     parser.add_argument("--first-seen-at", required=True)
+    parser.add_argument("--first-collected-at", default="")
     parser.add_argument("--source-timestamp-raw", default="")
     parser.add_argument("--source-timezone", default="")
     parser.add_argument("--expires-at", default="")
@@ -156,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
             booking_reference=args.booking_ref,
             observed_at=_parse_time(args.observed_at, "observed-at"),
             first_seen_at=_parse_time(args.first_seen_at, "first-seen-at"),
+            first_collected_at=(
+                _parse_time(args.first_collected_at, "first-collected-at")
+                if args.first_collected_at else None
+            ),
             source_timestamp_raw=args.source_timestamp_raw or None,
             source_timezone=args.source_timezone or None,
             policy=policy,

@@ -8,12 +8,28 @@ Live linkage stays blocked. Missing policy writes nothing and deletes nothing.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import retention
+
+
+@contextmanager
+def _store_lock(directory: str):
+    """Exclusive lock on the directory itself. No lock file is left behind."""
+    if os.path.islink(directory) or os.path.realpath(directory) != os.path.abspath(directory):
+        raise retention.RetentionRejected("records directory is a symlink; refusing to follow it")
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def new_lookup_id() -> str:
@@ -209,15 +225,87 @@ def _rewrite_json(path: str, episode_id: str, deadline: str) -> None:
         _write(path, json.dumps(updated, indent=2, sort_keys=True) + "\n")
 
 
+def _values_for_episode(data: object, episode_id: str, key: str) -> list[str]:
+    if not isinstance(data, dict) or not retention.mentions_episode(data, episode_id):
+        return []
+    found: list[str] = []
+    if isinstance(data.get(key), str):
+        found.append(data[key])
+    provenance = data.get("provenance")
+    if isinstance(provenance, dict) and isinstance(provenance.get(key), str):
+        found.append(provenance[key])
+    return found
+
+
+def _stored_origins(directory: str, episode_id: str) -> list[str]:
+    return _stored_strings(directory, episode_id, "first_collected_at")
+
+
+def _stored_strings(directory: str, episode_id: str, key: str) -> list[str]:
+    if not episode_id or not os.path.isdir(directory) or os.path.islink(directory):
+        return []
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames
+            if not os.path.islink(os.path.join(dirpath, name))
+        ]
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path) or name.endswith(".cleanup-tmp"):
+                continue
+            found.extend(_strings_in_file(path, episode_id, key))
+    return found
+
+
+def _strings_in_file(path: str, episode_id: str, key: str) -> list[str]:
+    if _record_kind(path) == "jsonl":
+        found: list[str] = []
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    data = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise retention.RetentionRejected(
+                        "unreadable records file blocks persistence; refusing to ignore its deadline"
+                    ) from exc
+                found.extend(_values_for_episode(data, episode_id, key))
+        return found
+    if _record_kind(path) == "json":
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise retention.RetentionRejected(
+                "unreadable records file blocks persistence; refusing to ignore its deadline"
+            ) from exc
+        return _values_for_episode(data, episode_id, key)
+    return []
+
+
 def _deadline_for_write(
     directory: str,
     episode_id: str,
     proposed: object,
     now: datetime,
     packet: dict | None = None,
+    policy: object = None,
+    first_collected_at: object = None,
 ) -> str:
     _guard_directory(directory)
     stored = _stored_deadlines(directory, episode_id)
+    if retention.policy_is_owner_23h(policy):
+        earliest = retention.bound_owner_deadline(
+            first_collected_at,
+            proposed,
+            stored,
+            _stored_origins(directory, episode_id),
+            now=now,
+        )
+        return earliest.isoformat()
     packet_deadlines = retention.iter_expires_at(packet) if packet is not None else []
     earliest = retention.resolve_episode_deadline(
         proposed,
@@ -342,6 +430,7 @@ def persist_bundle(
     deadline: datetime,
     *,
     now: datetime,
+    policy: object = None,
 ) -> dict:
     """Write the offline packet, result, query log, and research log together.
 
@@ -355,58 +444,73 @@ def persist_bundle(
                 "naive expires_at is rejected; timezone was not inferred"
             )
         episode = str(packet.get("episode", {}).get("episode_id", ""))
-        iso = _deadline_for_write(directory, episode, deadline, now, packet=packet)
-        _ensure_dir(directory)
-        _rewrite_tree(directory, episode, iso)
-        clean = retention.rewrite_expires_at(
-            retention.redact_identifying_contacts(packet),
-            iso,
-        )
-        clean["expires_at"] = iso
-        consistency = clean.get("consistency")
-        if isinstance(consistency, dict):
-            consistency["identity_proof"] = False
-            consistency["verified_export"] = False
-        slug = _slug(episode or "episode")
-        packets = os.path.join(directory, "packets")
-        results = os.path.join(directory, "results")
-        _ensure_dir(packets)
-        _ensure_dir(results)
-        _write(
-            os.path.join(packets, f"handoff-{slug}.json"),
-            json.dumps(clean, indent=2, sort_keys=True) + "\n",
-        )
-        _write(
-            os.path.join(results, f"{slug}.json"),
-            json.dumps(clean, indent=2, sort_keys=True) + "\n",
-        )
-        log_line = {
-            "episode_id": episode,
-            "outcome": clean.get("consistency", {}).get("status"),
-            "expires_at": iso,
-            "adapter": "mock",
-            "lane": clean.get("lane"),
-            "live_linkage": "blocked",
-        }
-        _write(
-            os.path.join(directory, "research-log.jsonl"),
-            json.dumps(log_line, sort_keys=True) + "\n",
-            append=True,
-        )
-        _write(
-            os.path.join(directory, "query-log.jsonl"),
-            json.dumps(
-                {
-                    "episode_id": episode,
-                    "expires_at": iso,
-                    "adapter": "mock",
-                    "kind": "query_log",
-                },
-                sort_keys=True,
+        origin = None
+        provenance = packet.get("provenance") if isinstance(packet.get("provenance"), dict) else {}
+        origin = provenance.get("first_collected_at")
+        if os.path.lexists(directory) and (
+            os.path.islink(directory) or os.path.realpath(directory) != os.path.abspath(directory)
+        ):
+            raise retention.RetentionRejected("records directory is a symlink; refusing to follow it")
+        if not os.path.isdir(directory):
+            os.makedirs(directory, mode=0o700)
+        _guard_directory(directory)
+        with _store_lock(directory):
+            iso = _deadline_for_write(
+                directory, episode, deadline, now, packet=packet, policy=policy,
+                first_collected_at=origin,
             )
-            + "\n",
-            append=True,
-        )
+            _ensure_dir(directory)
+            _rewrite_tree(directory, episode, iso)
+            clean = retention.rewrite_expires_at(
+                retention.redact_identifying_contacts(packet),
+                iso,
+            )
+            clean["expires_at"] = iso
+            consistency = clean.get("consistency")
+            if isinstance(consistency, dict):
+                consistency["identity_proof"] = False
+                consistency["verified_export"] = False
+            slug = _slug(episode or "episode")
+            packets = os.path.join(directory, "packets")
+            results = os.path.join(directory, "results")
+            _ensure_dir(packets)
+            _ensure_dir(results)
+            _write(
+                os.path.join(packets, f"handoff-{slug}.json"),
+                json.dumps(clean, indent=2, sort_keys=True) + "\n",
+            )
+            _write(
+                os.path.join(results, f"{slug}.json"),
+                json.dumps(clean, indent=2, sort_keys=True) + "\n",
+            )
+            log_line = {
+                "episode_id": episode,
+                "outcome": clean.get("consistency", {}).get("status"),
+                "expires_at": iso,
+                "adapter": "mock",
+                "lane": clean.get("lane"),
+                "live_linkage": "blocked",
+            }
+            if isinstance(origin, str):
+                log_line["first_collected_at"] = origin
+            _write(
+                os.path.join(directory, "research-log.jsonl"),
+                json.dumps(log_line, sort_keys=True) + "\n",
+                append=True,
+            )
+            query_line = {
+                "episode_id": episode,
+                "expires_at": iso,
+                "adapter": "mock",
+                "kind": "query_log",
+            }
+            if isinstance(origin, str):
+                query_line["first_collected_at"] = origin
+            _write(
+                os.path.join(directory, "query-log.jsonl"),
+                json.dumps(query_line, sort_keys=True) + "\n",
+                append=True,
+            )
     except retention.RetentionRejected as exc:
         return {
             "persisted": False,

@@ -14,9 +14,13 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 EXPLICIT_POLICY_MODE = "explicit_expires_at"
+OWNER_POLICY_MODE = "owner_first_collection_plus_23h"
+# Owner reply: delete local research records 23 hours after first collection.
+# This is not a caller-selected duration and it is not reset by later sightings.
+OWNER_RETENTION = timedelta(hours=23)
 
 DURATION_KEYS = (
     "hours",
@@ -126,13 +130,22 @@ def _has_duration(policy: dict) -> bool:
     return any(key in policy for key in DURATION_KEYS)
 
 
+def policy_is_owner_23h(policy: object) -> bool:
+    """True only for the owner-named 23-hour mode, with no caller duration field."""
+    return (
+        isinstance(policy, dict)
+        and policy.get("mode") == OWNER_POLICY_MODE
+        and not _has_duration(policy)
+    )
+
+
 def policy_is_explicit(policy: object) -> bool:
-    """True only for an explicit input policy that does not select a duration."""
+    """True for an explicit deadline policy that does not let the caller pick a duration."""
     return (
         isinstance(policy, dict)
         and policy.get("mode") == EXPLICIT_POLICY_MODE
         and not _has_duration(policy)
-    )
+    ) or policy_is_owner_23h(policy)
 
 
 def parse_expires_at(value: object, *, now: datetime) -> datetime:
@@ -163,6 +176,88 @@ def parse_expires_at(value: object, *, now: datetime) -> datetime:
     if parsed <= now:
         raise RetentionRejected("expired expires_at")
     return parsed
+
+
+def parse_trusted_time(value: object, *, now: datetime, field: str) -> datetime:
+    """Parse a trusted timezone-aware instant. Do not invent one."""
+    if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+        raise RetentionRejected("comparison clock must be timezone-aware")
+    parsed = try_aware_deadline(value)
+    if parsed is None:
+        raise RetentionRejected(
+            f"{field} is missing or not timezone-aware; origin time was not inferred"
+        )
+    if parsed > now:
+        raise RetentionRejected(f"{field} is in the future; origin time was not adjusted")
+    return parsed
+
+
+def owner_cap(first_collected_at: object, *, now: datetime) -> datetime:
+    """Return first collection plus the owner-authorized 23 hours."""
+    return parse_trusted_time(first_collected_at, now=now, field="first_collected_at") + OWNER_RETENTION
+
+
+def apply_owner_cap(packet: dict, *, now: datetime) -> dict:
+    """Bound a packet by first collection plus 23 hours.
+
+    Source timestamps are not read. A missing, naive, invalid, or future
+    first collection fails closed.
+    """
+    provenance = packet.get("provenance") if isinstance(packet.get("provenance"), dict) else {}
+    cap = owner_cap(provenance.get("first_collected_at"), now=now)
+    if cap <= now:
+        raise RetentionRejected(
+            "first collection plus 23 hours is already past; refusing a new copy"
+        )
+    supplied = []
+    for value in iter_expires_at(packet):
+        supplied.append(parse_expires_at(value, now=now))
+    if any(item > cap for item in supplied):
+        raise RetentionRejected(
+            "deadline would extend past first collection plus 23 hours"
+        )
+    bound = cap if not supplied else min([cap, *supplied])
+    updated = rewrite_expires_at(packet, bound.isoformat())
+    updated["expires_at"] = bound.isoformat()
+    return updated
+
+
+def bound_owner_deadline(
+    first_collected_at: object,
+    proposed: object,
+    stored_deadlines: list[object],
+    stored_origins: list[object],
+    *,
+    now: datetime,
+) -> datetime:
+    """Keep min(first collection + 23h, proposed, stored deadlines).
+
+    A stored first collection that disagrees with the new value fails closed.
+    The clock is not reset.
+    """
+    origin = parse_trusted_time(first_collected_at, now=now, field="first_collected_at")
+    parsed_origins = []
+    for value in stored_origins:
+        parsed = try_aware_deadline(value)
+        if parsed is None:
+            raise RetentionRejected(
+                "stored first collection is missing a timezone; refusing to infer or reset it"
+            )
+        parsed_origins.append(parsed)
+    if parsed_origins and set(parsed_origins) != {origin}:
+        raise RetentionRejected(
+            "first collection conflicts with the stored original; the clock was not reset"
+        )
+    cap = origin + OWNER_RETENTION
+    instants = [cap]
+    if proposed is not None:
+        instants.append(parse_expires_at(proposed, now=now))
+    for value in stored_deadlines:
+        instants.append(parse_expires_at(value, now=now))
+    earliest = min(instants)
+    if earliest > cap:
+        raise RetentionRejected("deadline would extend past first collection plus 23 hours")
+    return earliest
 
 
 def propose_deadline(current: object, proposed: object, *, now: datetime) -> datetime:
