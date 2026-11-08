@@ -243,9 +243,7 @@ def _authorize(policy: object, expires_at: object, now: datetime | None) -> rete
 
 
 def _slug(episode_id: str) -> str:
-    slug = "".join(char if char.isalnum() else "-" for char in episode_id)
-    parts = [part for part in slug.split("-") if part]
-    return ("-".join(parts)[:140] or "episode")
+    return retention.episode_slug(episode_id)
 
 
 def log_event(

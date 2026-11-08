@@ -67,6 +67,10 @@ PERSISTED_ARTIFACT_CATALOG = (
         "kind": "identifying_hash_sidecar",
         "where": "sha256 or .hash sidecars beside research records",
     },
+    {
+        "kind": "synthetic_store_marker",
+        "where": "synthetic-store.json, a non-identifying marker required before synthetic cleanup",
+    },
 )
 
 _CONTACT_KEYS = {
@@ -409,6 +413,17 @@ def resolve_episode_deadline(
     return earliest
 
 
+def episode_slug(episode_id: str) -> str:
+    """Filename slug for an episode. This is not an identifying hash."""
+    slug = "".join(char if char.isalnum() else "-" for char in episode_id)
+    parts = [part for part in slug.split("-") if part]
+    return "-".join(parts)[:140] or "episode"
+
+
+def is_hash_sidecar(path: str) -> bool:
+    return _is_hash_sidecar(os.path.basename(path))
+
+
 def _is_hash_sidecar(base: str) -> bool:
     folded = base.casefold()
     return (
@@ -433,6 +448,8 @@ def classify_artifact(relative_path: str) -> list[str]:
         if kind not in kinds:
             kinds.append(kind)
 
+    if folded == "synthetic-store.json":
+        add("synthetic_store_marker")
     if folded in {"query-log.jsonl", "query_log.jsonl"} or folded.endswith(".query.jsonl"):
         add("query_log")
     if folded in {"audit-events.jsonl", "audit_events.jsonl"} or "audit" in folded:
