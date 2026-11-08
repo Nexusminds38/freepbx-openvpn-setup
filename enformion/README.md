@@ -98,9 +98,22 @@ authorized.
 
 ## Retention
 
-This lane does not choose a retention duration. An owner duration was not
-verified here, so none is configured, including any numeric proposal made
-elsewhere.
+The owner authorized one local retention rule: delete research records 23
+hours after the original first collection, and do not reset that clock when
+the same episode is seen again or handed off later. The mode name is
+`owner_first_collection_plus_23h`. It is not a caller-supplied hour count.
+`first_collected_at` must be a trusted timezone-aware instant. A raw source
+timestamp is not that instant and is not parsed to fill it. A missing, naive,
+invalid, future, or conflicting first collection fails closed and does not
+change stored bytes. The stored deadline is the earlier of first collection
+plus 23 hours and any existing expiry. It is never moved later.
+
+That rule covers records this program writes inside the configured directory:
+packets, results, query logs, research logs, backups, queue files, and
+sidecars tied to an episode. Chat transcripts, provider copies, disk
+snapshots, and other systems outside this directory are not covered and are
+not claimed compliant. Nothing here runs on a schedule, and a passing test
+does not mean production records were deleted at 23 hours.
 
 Real persistence requires all of the following:
 

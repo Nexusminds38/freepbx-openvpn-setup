@@ -70,11 +70,12 @@ def build_provenance(
     first_seen_at: datetime,
     source_timestamp_raw: str | None = None,
     source_timezone: str | None = None,
+    first_collected_at: datetime | None = None,
 ) -> dict:
     """Keep raw source time separate from observed and first-seen times.
 
     ``source_timestamp_raw`` is stored unchanged. This function does not parse
-    it and does not copy an offset out of it into ``source_timezone``.
+    it and does not copy it into ``first_collected_at`` or ``source_timezone``.
     """
     if source_timezone is None or (isinstance(source_timezone, str) and not source_timezone.strip()):
         zone = None
@@ -89,6 +90,10 @@ def build_provenance(
         "source_timezone_inferred": False,
         "observed_at": _aware_iso(observed_at, "observed_at"),
         "first_seen_at": _aware_iso(first_seen_at, "first_seen_at"),
+        "first_collected_at": (
+            None if first_collected_at is None
+            else _aware_iso(first_collected_at, "first_collected_at")
+        ),
     }
 
 
@@ -103,6 +108,7 @@ def build_packet(
     supplied_identifiers: dict,
     source_timestamp_raw: str | None = None,
     source_timezone: str | None = None,
+    first_collected_at: datetime | None = None,
     expires_at: object = None,
     referral_authorization: object = ABSENT,
     synthetic: bool = True,
@@ -145,6 +151,7 @@ def build_packet(
             first_seen_at=first_seen_at,
             source_timestamp_raw=source_timestamp_raw,
             source_timezone=source_timezone,
+            first_collected_at=first_collected_at,
         ),
         "supplied_identifiers": identifiers,
         "consistency": redact_identifying_contacts(consistency),

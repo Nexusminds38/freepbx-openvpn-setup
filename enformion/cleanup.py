@@ -174,6 +174,7 @@ def _empty_report(now: datetime, policy: object) -> dict:
             "malformed_deadline_records": 0,
             "ambiguous_records": 0,
             "unknown_files": 0,
+            "transaction_artifacts": 0,
             "conflicting_deadline_records": 0,
             "eligible_files": 0,
             "eligible_log_lines": 0,
@@ -325,6 +326,9 @@ def _classify_store(root: str, now: datetime, report: dict) -> None:
                 continue
             counts["files_before"] += 1
             if name == MARKER_NAME and dirpath == root:
+                continue
+            if name.endswith(".cleanup-tmp"):
+                counts["transaction_artifacts"] += 1
                 continue
             if retention.is_hash_sidecar(path):
                 sidecars.append({"path": path, "relative": relative, "name": name})
@@ -478,16 +482,20 @@ def _apply(root: str, now: datetime, report: dict) -> dict:
     removed_lines = 0
     removed_sidecars = 0
     try:
-        for path, indexes in sorted(report["_line_units"].items()):
-            removed_lines += _drop_lines(root, path, indexes, now)
-        for unit in report["_file_units"]:
-            _unlink_contained(root, unit["path"])
-            removed_files += 1
-        for sidecar in report["_sidecars"]:
-            _unlink_contained(root, sidecar["path"])
-            removed_sidecars += 1
-            removed_files += 1
-        _remove_empty_dirs(root)
+        import audit
+        with audit._store_lock(root):
+            recovered = _recover_transaction_files(root)
+            for path, indexes in sorted(report["_line_units"].items()):
+                removed_lines += _drop_lines(root, path, indexes, now)
+            for unit in report["_file_units"]:
+                _unlink_contained(root, unit["path"])
+                removed_files += 1
+            for sidecar in report["_sidecars"]:
+                _unlink_contained(root, sidecar["path"])
+                removed_sidecars += 1
+                removed_files += 1
+            _remove_empty_dirs(root)
+        removed_files += recovered
     except OSError:
         report["partial_failure"] = True
         report["applied"] = True
@@ -512,7 +520,8 @@ def _apply(root: str, now: datetime, report: dict) -> dict:
 
 def _drop_lines(root: str, path: str, indexes: set[int], now: datetime) -> int:
     _require_exclusive_file(root, path)
-    raw_lines = _read_text_nofollow(path).splitlines(keepends=True)
+    expected = _read_text_nofollow(path)
+    raw_lines = expected.splitlines(keepends=True)
     if any(index < 0 or index >= len(raw_lines) for index in indexes):
         raise OSError("log changed before cleanup")
     kept: list[str] = []
@@ -530,20 +539,36 @@ def _drop_lines(root: str, path: str, indexes: set[int], now: datetime) -> int:
         if state != "aware" or deadline is None or deadline > now or len(ids) != 1:
             raise OSError("log line is no longer an expired episode")
         removed += 1
+    _publish_if_unchanged(root, path, "".join(kept), expected)
+    return removed
+
+
+def _publish_if_unchanged(root: str, path: str, new_text: str, expected_text: str) -> None:
+    """Replace a file only when its bytes still match the decision snapshot.
+
+    The temporary name is on the same filesystem and is removed before this
+    function returns. A crash can still leave that name; the next authorized
+    cleanup deletes leftover ``.cleanup-tmp`` files without reading them.
+    """
     _require_exclusive_file(root, path)
+    if _read_text_nofollow(path) != expected_text:
+        raise OSError("file changed before replace")
     temporary = path + ".cleanup-tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, 0o600)
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
     try:
-        os.write(descriptor, "".join(kept).encode())
-    finally:
-        os.close(descriptor)
-    try:
+        os.write(descriptor, new_text.encode())
+        os.fsync(descriptor)
+        if _read_text_nofollow(path) != expected_text:
+            raise OSError("file changed before replace")
         os.replace(temporary, path)
     finally:
-        if os.path.exists(temporary):
+        os.close(descriptor)
+        if os.path.lexists(temporary):
             os.unlink(temporary)
-    return removed
 
 
 def _require_exclusive_file(root: str, path: str) -> None:
@@ -560,6 +585,20 @@ def _require_exclusive_file(root: str, path: str) -> None:
 def _unlink_contained(root: str, path: str) -> None:
     _require_exclusive_file(root, path)
     os.unlink(path)
+
+
+def _recover_transaction_files(root: str) -> int:
+    """Delete leftover cleanup temp files. Do not read their contents."""
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+        for name in filenames:
+            if not name.endswith(".cleanup-tmp"):
+                continue
+            path = os.path.join(dirpath, name)
+            _unlink_contained(root, path)
+            removed += 1
+    return removed
 
 
 def _remove_empty_dirs(root: str) -> None:
