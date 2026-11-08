@@ -1,11 +1,7 @@
-"""View the Enformion research log — the kept track of every lookup.
+"""View an explicitly configured offline research log.
 
-Usage:
-  python3 research_log.py [--last N] [--subject "First Last"] [--verified]
-
-Metadata only: timestamps, subject queried, verdict, counts, and the kept
-record's path. Contact PII is never printed here — it lives in the stored
-result files (see audit.py) and comes out through run_lookup.py / packets.
+This viewer does not create a records directory and does not open the
+historical hidden_files default. Contact fields are not printed.
 """
 
 from __future__ import annotations
@@ -15,56 +11,39 @@ import json
 import os
 import sys
 
-import audit
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Show the offline research log.")
+    parser.add_argument("--last", type=int, default=20)
+    args = parser.parse_args(argv)
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--last", type=int, default=20)
-    ap.add_argument("--subject", default="")
-    ap.add_argument("--verified", action="store_true")
-    args = ap.parse_args()
-
-    log_path = os.path.join(audit.records_dir(), "research-log.jsonl")
-    if not os.path.exists(log_path):
-        print("No lookups logged yet.")
+    directory = os.environ.get("ENFORMION_RECORDS_DIR")
+    if not directory:
+        print(
+            "Research log unavailable: no records directory is configured. "
+            "No default store was opened."
+        )
+        return 0
+    log_path = os.path.join(directory, "research-log.jsonl")
+    if not os.path.isfile(log_path):
+        print("No lookups logged in the configured directory.")
         return 0
 
     events = []
-    with open(log_path) as fh:
-        for line in fh:
+    with open(log_path, encoding="utf-8") as handle:
+        for line in handle:
             line = line.strip()
             if line:
                 events.append(json.loads(line))
-
-    total = len(events)
-    counts: dict[str, int] = {}
-    for ev in events:
-        counts[ev["outcome"]] = counts.get(ev["outcome"], 0) + 1
-
-    if args.subject:
-        first, _, last = args.subject.partition(" ")
-        events = [e for e in events
-                  if e["query"]["first"].lower() == first.lower()
-                  and e["query"]["last"].lower() == last.lower()]
-    if args.verified:
-        events = [e for e in events if e["outcome"] == "VERIFIED"]
-    events = events[-args.last:]
-
-    summary = " · ".join(f"{k} {v}" for k, v in sorted(counts.items()))
-    print(f"Research log: {total} lookup(s) total — {summary}")
-    for ev in events:
-        q = ev["query"]
-        line = (f"{ev['ts_local'] or ev['ts_utc']}  [{ev['lookup_id']}]  "
-                f"{q['first']} {q['last']} — {q['city']}, {q['state']}, "
-                f"age {q['age']}  → {ev['outcome']}")
-        if ev["outcome"] == "VERIFIED":
-            line += (f"  ({ev['relatives_returned']} relatives, "
-                     f"{ev['phones_returned']} numbers; kept: {ev['result_file']})")
-        elif ev.get("reason"):
-            line += f"  ({ev['reason']})"
-        if ev.get("source_ref"):
-            line += f"  [source: {ev['source_ref']}]"
+    shown = events[-args.last:]
+    print(f"Research log: {len(events)} event(s) in the configured directory.")
+    for event in shown:
+        episode = event.get("episode_id") or event.get("lookup_id") or ""
+        outcome = event.get("outcome", "")
+        expires = event.get("expires_at")
+        line = f"{episode}  →  {outcome}"
+        if expires:
+            line += f"  expires {expires}"
         print(line)
     return 0
 
