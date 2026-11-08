@@ -165,23 +165,17 @@ duration field and a `synthetic-store.json` marker. `mark_synthetic_store`
 writes that marker only into an empty directory, so an existing store cannot
 be labeled after the fact. The marker has no episode, name, or deadline.
 
-Records for one episode are deleted only when every deadline on that episode
-is the same timezone-aware instant and that instant is at or before the
-supplied clock. Differing deadlines block the episode. Hardlinks and symlinks
-block the whole cleanup. An untied identifying sidecar or an unclassified
-file also blocks the cleanup instead of being skipped.
+A file is removed only when every record in it belongs to an expired episode.
+Cleanup does not rewrite a log or backup, and it does not create a
+`.cleanup-tmp` copy. A file that also holds a retained, blocked, or ownerless
+record stays on disk, and the expired episode's other files stay with it.
+Differing deadlines, hardlinks, symlinks, untied sidecars, and unclassified
+files still block deletion.
 
-A record is removable only when every copy of its episode has one
-timezone-aware deadline and the earliest instant is less than or equal to
-the supplied clock. The same instant expressed with a numeric offset is the
-same deadline. A missing, naive, or unreadable deadline blocks that episode
-and is counted without deleting it. A log line with no episode id is left
-in place. Lines for a different, still-unexpired episode in the same log or
-backup are left in place. An identifying sidecar is removed only when its
-filename matches exactly one expired episode; an untied sidecar is counted
-and kept. Symlinks and paths that leave the store block the whole cleanup.
-No identifying tombstone or hash is written. A partial failure stops further
-deletes.
+This program's writer and cleanup take an advisory lock on the store
+directory. A process that writes those files without the lock is unsupported.
+If the file bytes change before unlink, cleanup deletes nothing. That check
+does not close a later change by a noncooperating writer.
 
 Unknown or malformed deadlines block live linkage. The cleanup report sets
 `retention_compliance_claimed` false. Fixture cleanup does not prove that
@@ -203,7 +197,7 @@ Code in this lane:
 
 Still required before any operational use:
 
-- An owner-confirmed retention duration. None is configured here.
+- A decision to deploy this code and a scheduler. The 23-hour rule is not running anywhere.
 - A decision on the production destination. None is wired.
 - A real-store inventory and an authorized deletion run against that store,
   including backups and copies outside this repository.

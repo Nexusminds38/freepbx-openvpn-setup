@@ -183,10 +183,10 @@ class OwnerRetentionTests(unittest.TestCase):
                 if path == log:
                     state["n"] += 1
                     if state["n"] == 2:
+                        extra = '{"episode_id":"added-later","expires_at":"2026-12-01T00:00:00+00:00"}\n'
                         with open(path, "a", encoding="utf-8") as handle:
-                            handle.write(
-                                '{"episode_id":"added-later","expires_at":"2026-12-01T00:00:00+00:00"}\n'
-                            )
+                            handle.write(extra)
+                        return text + extra
                 return text
 
             with patch("cleanup._read_text_nofollow", change_after_decision_read):
@@ -197,7 +197,9 @@ class OwnerRetentionTests(unittest.TestCase):
                     apply=True,
                     confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
                 )
-            self.assertTrue(applied["partial_failure"])
+            self.assertFalse(applied["applied"])
+            self.assertFalse(applied["partial_failure"])
+            self.assertEqual(applied["counts"]["removed_files"], 0)
             with open(log, encoding="utf-8") as handle:
                 body = handle.read()
             self.assertIn("old", body)
