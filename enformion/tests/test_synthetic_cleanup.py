@@ -88,6 +88,7 @@ class SyntheticCleanupTests(unittest.TestCase):
 
     def test_smoke_handoff_then_explicit_synthetic_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            cleanup.mark_synthetic_store(tmp)
             expired = _prepare(tmp, "BK-FICTION-0001", "2026-11-10T00:00:00+00:00")
             retained = _prepare(tmp, "BK-FICTION-0002", "2026-11-20T15:00:00-05:00")
             self.assertEqual(expired["consistency"]["status"], "candidate_consistent")
@@ -110,7 +111,6 @@ class SyntheticCleanupTests(unittest.TestCase):
                 + json.dumps({"episode_id": retained_id, "expires_at": "2026-11-20T15:00:00-05:00"}) + "\n",
             )
             _write(os.path.join(tmp, "results", slug + ".sha256"), "synthetic-sidecar\n")
-            _write(os.path.join(tmp, "results", "untied.sha256"), "untied-sidecar\n")
             offset_id = "county=example county|source=https://example.org/fictional-roster|booking=bk-fiction-offset"
             _write(
                 os.path.join(tmp, "results", retention.episode_slug(offset_id) + ".json"),
@@ -126,8 +126,6 @@ class SyntheticCleanupTests(unittest.TestCase):
             _write(naive_path, json.dumps({"episode_id": naive_id, "expires_at": "2026-11-01T00:00:00"}) + "\n")
             with open(os.path.join(tmp, "research-log.jsonl"), "a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"note": "orphan-line", "expires_at": "2026-11-01T00:00:00+00:00"}) + "\n")
-            cleanup.mark_synthetic_store(tmp)
-
             before = _snapshot(tmp)
             self.assertGreater(len(before), 0)
             dry = cleanup.apply_synthetic_cleanup(tmp, now=CLOCK, policy=POLICY, apply=False)
@@ -146,7 +144,9 @@ class SyntheticCleanupTests(unittest.TestCase):
             self.assertNotIn("Casey", report_text)
             self.assertNotIn("synthetic-sidecar", report_text)
 
-            applied = cleanup.apply_synthetic_cleanup(tmp, now=CLOCK, policy=POLICY, apply=True)
+            applied = cleanup.apply_synthetic_cleanup(
+                tmp, now=CLOCK, policy=POLICY, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+            )
             self.assertTrue(applied["applied"])
             self.assertFalse(applied["partial_failure"])
             self.assertGreater(applied["counts"]["removed_files"], 0)
@@ -155,7 +155,6 @@ class SyntheticCleanupTests(unittest.TestCase):
             self.assertLess(applied["counts"]["files_after"], applied["counts"]["files_before"])
             after = _snapshot(tmp)
             self.assertNotIn("results/" + slug + ".sha256", after)
-            self.assertIn("results/untied.sha256", after)
             self.assertIn("synthetic-store.json", after)
             self.assertIn(os.path.relpath(naive_path, tmp), after)
             combined = "\n".join(text.decode() for text in after.values())
@@ -172,36 +171,51 @@ class SyntheticCleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _prepare(tmp, "BK-FICTION-0001", "2026-11-10T00:00:00+00:00")
             before = _snapshot(tmp)
-            unmarked = cleanup.apply_synthetic_cleanup(tmp, now=CLOCK, policy=POLICY, apply=True)
+            unmarked = cleanup.apply_synthetic_cleanup(
+                tmp, now=CLOCK, policy=POLICY, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+            )
             self.assertFalse(unmarked["applied"])
             self.assertEqual(_snapshot(tmp), before)
-            cleanup.mark_synthetic_store(tmp)
-            marked = _snapshot(tmp)
-            missing_policy = cleanup.apply_synthetic_cleanup(tmp, now=CLOCK, policy=None, apply=True)
+            with self.assertRaises(cleanup.CleanupError):
+                cleanup.mark_synthetic_store(tmp)
+            self.assertNotIn("synthetic-store.json", _snapshot(tmp))
+        with tempfile.TemporaryDirectory() as empty:
+            cleanup.mark_synthetic_store(empty)
+            _write(os.path.join(empty, "results", "old.json"), '{"episode_id":"old","expires_at":"2026-11-01T00:00:00+00:00"}\n')
+            marked = _snapshot(empty)
+            missing_confirm = cleanup.apply_synthetic_cleanup(empty, now=CLOCK, policy=POLICY, apply=True)
+            self.assertFalse(missing_confirm["applied"])
+            self.assertEqual(_snapshot(empty), marked)
+            missing_policy = cleanup.apply_synthetic_cleanup(
+                empty, now=CLOCK, policy=None, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+            )
             self.assertFalse(missing_policy["applied"])
             self.assertEqual(missing_policy["live_linkage"], "blocked")
-            self.assertEqual(_snapshot(tmp), marked)
+            self.assertEqual(_snapshot(empty), marked)
             duration = cleanup.apply_synthetic_cleanup(
-                tmp,
+                empty,
                 now=CLOCK,
                 policy={"mode": "explicit_expires_at", "duration": "unverified"},
                 apply=True,
+                confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
             )
             self.assertFalse(duration["applied"])
-            self.assertEqual(_snapshot(tmp), marked)
+            self.assertEqual(_snapshot(empty), marked)
 
     def test_symlink_and_ambiguous_episode_block_guessing(self) -> None:
         with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as root:
             outside_file = os.path.join(outside, "record.json")
             _write(outside_file, '{"episode_id":"outside","expires_at":"2026-11-01T00:00:00+00:00"}\n')
-            os.symlink(outside_file, os.path.join(root, "escape.json"))
             cleanup.mark_synthetic_store(root)
+            os.symlink(outside_file, os.path.join(root, "escape.json"))
             _write(
                 os.path.join(root, "results", "local.json"),
                 '{"episode_id":"local","expires_at":"2026-11-01T00:00:00+00:00"}\n',
             )
             before = _snapshot(root)
-            applied = cleanup.apply_synthetic_cleanup(root, now=CLOCK, policy=POLICY, apply=True)
+            applied = cleanup.apply_synthetic_cleanup(
+                root, now=CLOCK, policy=POLICY, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+            )
             self.assertFalse(applied["applied"])
             self.assertTrue(applied["containment_blockers"])
             self.assertEqual(_snapshot(root), before)
@@ -220,7 +234,9 @@ class SyntheticCleanupTests(unittest.TestCase):
                     '{"episode_id":"expired-clear","expires_at":"not-a-deadline"}',
                 ]) + "\n",
             )
-            applied = cleanup.apply_synthetic_cleanup(tmp, now=CLOCK, policy=POLICY, apply=True)
+            applied = cleanup.apply_synthetic_cleanup(
+                tmp, now=CLOCK, policy=POLICY, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+            )
             self.assertEqual(applied["counts"]["removed_files"], 0)
             self.assertEqual(applied["counts"]["removed_log_lines"], 0)
             self.assertGreater(applied["counts"]["malformed_deadline_records"], 0)
@@ -249,7 +265,9 @@ class SyntheticCleanupTests(unittest.TestCase):
                 real_unlink(path)
 
             with patch("cleanup.os.unlink", flaky):
-                applied = cleanup.apply_synthetic_cleanup(tmp, now=CLOCK, policy=POLICY, apply=True)
+                applied = cleanup.apply_synthetic_cleanup(
+                    tmp, now=CLOCK, policy=POLICY, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+                )
             self.assertTrue(applied["partial_failure"])
             self.assertEqual(applied["counts"]["removed_files"], 1)
             names = set(os.listdir(os.path.join(tmp, "results")))
@@ -274,7 +292,9 @@ class SyntheticCleanupTests(unittest.TestCase):
                 os.path.join(tmp, "results", "future.json"),
                 '{"episode_id":"future","expires_at":"2026-11-09T19:00:01-05:00"}\n',
             )
-            applied = cleanup.apply_synthetic_cleanup(tmp, now=CLOCK, policy=POLICY, apply=True)
+            applied = cleanup.apply_synthetic_cleanup(
+                tmp, now=CLOCK, policy=POLICY, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+            )
             self.assertTrue(applied["applied"])
             remaining = os.listdir(os.path.join(tmp, "results"))
             self.assertEqual(remaining, ["future.json"])
@@ -286,3 +306,63 @@ class SyntheticCleanupTests(unittest.TestCase):
                 retention.try_aware_deadline("2026-11-09T19:00:01-05:00"),
                 CLOCK + timedelta(seconds=1),
             )
+
+    def test_hardlink_conflict_and_untied_sidecar_block_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as root:
+            cleanup.mark_synthetic_store(root)
+            inside = os.path.join(root, "results", "linked.json")
+            _write(inside, '{"episode_id":"linked","expires_at":"2026-11-01T00:00:00+00:00"}\n')
+            outside_name = os.path.join(outside, "linked.json")
+            os.link(inside, outside_name)
+            before = _snapshot(root)
+            with open(outside_name, "rb") as handle:
+                outside_before = handle.read()
+            applied = cleanup.apply_synthetic_cleanup(
+                root, now=CLOCK, policy=POLICY, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+            )
+            self.assertFalse(applied["applied"])
+            self.assertTrue(applied["containment_blockers"])
+            self.assertEqual(applied["counts"]["removed_files"], 0)
+            self.assertEqual(applied["counts"]["files_after"], applied["counts"]["files_before"])
+            self.assertGreater(applied["counts"]["files_before"], 0)
+            self.assertEqual(_snapshot(root), before)
+            with open(outside_name, "rb") as handle:
+                self.assertEqual(handle.read(), outside_before)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cleanup.mark_synthetic_store(tmp)
+            _write(os.path.join(tmp, "results", "early.json"), '{"episode_id":"split","expires_at":"2026-11-01T00:00:00+00:00"}\n')
+            _write(os.path.join(tmp, "results", "late.json"), '{"episode_id":"split","expires_at":"2026-12-01T00:00:00+00:00"}\n')
+            _write(os.path.join(tmp, "results", "untied.sha256"), "untied-sidecar\n")
+            before = _snapshot(tmp)
+            early_clock = datetime(2026, 11, 9, tzinfo=timezone.utc)
+            dry_early = cleanup.plan_cleanup(tmp, now=early_clock, policy=POLICY)
+            dry_late = cleanup.plan_cleanup(tmp, now=CLOCK, policy=POLICY)
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertGreater(dry_late["counts"]["conflicting_deadline_records"], 0)
+            self.assertEqual(dry_early["evaluated_at"], early_clock.isoformat())
+            self.assertEqual(dry_late["evaluated_at"], CLOCK.isoformat())
+            applied = cleanup.apply_synthetic_cleanup(
+                tmp, now=CLOCK, policy=POLICY, apply=True, confirm=cleanup.SYNTHETIC_APPLY_CONFIRMATION,
+            )
+            self.assertFalse(applied["applied"])
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertIn("untied-sidecar", before["results/untied.sha256"].decode())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cleanup.mark_synthetic_store(tmp)
+            _write(
+                os.path.join(tmp, "results", "later.json"),
+                '{"episode_id":"later","expires_at":"2026-11-20T00:00:00+00:00"}\n',
+            )
+            before = _snapshot(tmp)
+            early = cleanup.plan_cleanup(tmp, now=CLOCK, policy=POLICY)
+            late = cleanup.plan_cleanup(
+                tmp, now=datetime(2026, 11, 20, 0, 0, tzinfo=timezone.utc), policy=POLICY,
+            )
+            self.assertEqual(_snapshot(tmp), before)
+            self.assertEqual(early["counts"]["eligible_files"], 0)
+            self.assertEqual(early["counts"]["retained_episodes"], 1)
+            self.assertEqual(late["counts"]["eligible_files"], 1)
+            self.assertEqual(late["counts"]["expired_episodes"], 1)
+            self.assertEqual(late["counts"]["removed_files"], 0)

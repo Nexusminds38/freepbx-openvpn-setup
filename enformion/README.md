@@ -146,10 +146,17 @@ does not copy record bodies into the report. `would_delete` is false.
 
 `cleanup.plan_cleanup` counts expired, retained, missing, malformed, and
 ambiguous records and deletes nothing. `cleanup.apply_synthetic_cleanup`
-also deletes nothing unless `apply=True`. Apply additionally requires an
-explicit `explicit_expires_at` policy with no duration field and a
-`synthetic-store.json` marker written by `cleanup.mark_synthetic_store`.
-The marker has no episode, name, or deadline.
+also deletes nothing unless `apply=True` and `confirm="synthetic-test-store"`.
+Apply additionally requires an explicit `explicit_expires_at` policy with no
+duration field and a `synthetic-store.json` marker. `mark_synthetic_store`
+writes that marker only into an empty directory, so an existing store cannot
+be labeled after the fact. The marker has no episode, name, or deadline.
+
+Records for one episode are deleted only when every deadline on that episode
+is the same timezone-aware instant and that instant is at or before the
+supplied clock. Differing deadlines block the episode. Hardlinks and symlinks
+block the whole cleanup. An untied identifying sidecar or an unclassified
+file also blocks the cleanup instead of being skipped.
 
 A record is removable only when every copy of its episode has one
 timezone-aware deadline and the earliest instant is less than or equal to
