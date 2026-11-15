@@ -109,11 +109,12 @@ change stored bytes. The stored deadline is the earlier of first collection
 plus 23 hours and any existing expiry. It is never moved later.
 
 That rule covers records this program writes inside the configured directory:
-packets, results, query logs, research logs, backups, queue files, and
-sidecars tied to an episode. Chat transcripts, provider copies, disk
-snapshots, and other systems outside this directory are not covered and are
-not claimed compliant. Nothing here runs on a schedule, and a passing test
-does not mean production records were deleted at 23 hours.
+one directory per episode for the research and query logs, plus the packet,
+the result, single-episode backups, and a sidecar tied to that episode.
+Chat transcripts, provider copies, disk snapshots, and other systems outside
+this directory are not covered and are not claimed compliant. Nothing here
+runs on a schedule, and a passing test does not mean production records were
+deleted at 23 hours.
 
 Real persistence requires all of the following:
 
@@ -136,7 +137,9 @@ No identifying hash is written.
 
 Live linkage remains `blocked` after an authorized offline copy.
 
-Re-ingestion of the same episode cannot move that deadline later, including when a new timestamp is an earlier calendar string but a later instant. A shorter deadline is written onto the packet, the result, and every stored log or backup line for that episode. A naive or invalid deadline already on disk blocks the write; a timezone is not invented for it, and the bytes are not deleted. The records directory, a path that resolves through a symlink, and any symlink inside the directory are not followed. An identifying-hash sidecar blocks a new write and is left in place for the dry-run inventory.
+Re-ingestion of the same episode cannot move that deadline later, including when a new timestamp is an earlier calendar string but a later instant. A shorter deadline is written onto that episode's own packet, result, and log files. A file that also holds another episode, or a line with no single episode, is not rewritten; the write fails closed and the bytes stay. A naive or invalid deadline already on disk blocks the write; a timezone is not invented for it, and the bytes are not deleted. The records directory, a path that resolves through a symlink, and any symlink inside the directory are not followed. An identifying-hash sidecar blocks a new write and is left in place for the dry-run inventory.
+
+New research and query lines go to `episodes/<episode>/research.jsonl` and `query.jsonl`. The name is created with `linkat` only after the bytes are complete, so a crash before that leaves no file. Replacing one episode's existing file stages `name.replacing` and then renames it. Recovery keeps the earlier timezone-aware deadline and discards a later one. It does not compare the deadline strings.
 
 ### Artifact inventory
 
@@ -144,9 +147,9 @@ Re-ingestion of the same episode cannot move that deadline later, including when
 
 | Kind | Location |
 | --- | --- |
-| `query_log` | `query-log.jsonl` |
-| `audit_log` | `audit-events.jsonl` and audit lines in `research-log.jsonl` |
-| `research_log` | `research-log.jsonl` |
+| `query_log` | `episodes/<episode>/query.jsonl` and legacy `query-log.jsonl` |
+| `audit_log` | `audit-events.jsonl` and research-log lines |
+| `research_log` | `episodes/<episode>/research.jsonl` and legacy `research-log.jsonl` |
 | `saved_result_json` | `results/*.json` |
 | `relative_output` | relative phone JSON |
 | `handoff_packet` | `packets/` and `handoff*.json` |
@@ -166,16 +169,27 @@ writes that marker only into an empty directory, so an existing store cannot
 be labeled after the fact. The marker has no episode, name, or deadline.
 
 A file is removed only when every record in it belongs to an expired episode.
-Cleanup does not rewrite a log or backup, and it does not create a
-`.cleanup-tmp` copy. A file that also holds a retained, blocked, or ownerless
-record stays on disk, and the expired episode's other files stay with it.
-Differing deadlines, hardlinks, symlinks, untied sidecars, and unclassified
-files still block deletion.
+Removal is `unlink`. Cleanup does not rewrite a log or backup, and it does
+not create a `.cleanup-tmp` copy. An expired episode that still shares a
+legacy file with a record that must stay is kept, including its other files,
+and the report does not claim retention compliance.
 
-This program's writer and cleanup take an advisory lock on the store
-directory. A process that writes those files without the lock is unsupported.
-If the file bytes change before unlink, cleanup deletes nothing. That check
-does not close a later change by a noncooperating writer.
+`cleanup.migrate_mixed_logs` is the explicit path for a legacy mixed log in a
+marked synthetic store. It requires `confirm="synthetic-test-store"`. Each
+episode's original lines are published as a complete per-episode file, and
+the mixed file is unlinked only if its bytes are still the snapshot. A line
+with no single episode, or an unreadable line, stops the migration; the mixed
+file stays, and compliance is not claimed. A crash after a per-episode file
+is published leaves that complete file and the mixed original. The next run
+does not write a second copy of the same bytes.
+
+This program's writer, migration, and cleanup take an advisory lock on the
+store directory. A process that writes those files without the lock is
+unsupported. The lock does not stop it. The byte check before unlink does
+not cover a write that lands after the check. When one episode has more than
+one timezone-aware deadline, the earliest instant is the deadline. A naive
+or invalid deadline still blocks that episode. Hardlinks, symlinks, untied
+sidecars, and unclassified files still block deletion.
 
 Unknown or malformed deadlines block live linkage. The cleanup report sets
 `retention_compliance_claimed` false. Fixture cleanup does not prove that
@@ -218,7 +232,7 @@ identifying-hash sidecar remains. This branch does not run that procedure.
 From `enformion/`:
 
 ```bash
-python3 -W error::ResourceWarning -m unittest tests.test_offline_acceptance tests.test_synthetic_cleanup -v
+python3 -W error::ResourceWarning -m unittest tests.test_offline_acceptance tests.test_synthetic_cleanup tests.test_owner_retention tests.test_episode_layout -v
 ```
 
 The suite uses fictional identifiers, denies sockets and HTTP, and does not
@@ -233,13 +247,16 @@ is required.
 - `handoff.py` — synthetic handoff contract and episode key.
 - `receiver.py` — offline receiver.
 - `retention.py` — deadline rules, authorization, dry-run inventory.
-- `cleanup.py` — dry-run by default; explicit synthetic-store cleanup.
+- `cleanup.py` — dry-run by default; explicit synthetic-store cleanup and mixed-log migration.
+- `publish.py` — complete-file publication for one episode.
 - `audit.py` — optional offline copy when authorization succeeds.
 - `research_log.py` — read a configured directory; do not create the default store.
 - `relative_phones.py` — disabled entry points.
 - `dormant_discovery.py` — refusal boundary, not imported by the default path.
 - `tests/test_offline_acceptance.py` — offline acceptance tests.
 - `tests/test_synthetic_cleanup.py` — synthetic cleanup and handoff smoke test.
+- `tests/test_owner_retention.py` — the 23-hour first-collection rule.
+- `tests/test_episode_layout.py` — per-episode files, migration, crash, and lock tests.
 
 ## Still disconnected
 

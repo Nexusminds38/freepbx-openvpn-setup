@@ -15,6 +15,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+import publish
 import retention
 
 
@@ -34,6 +35,16 @@ def _store_lock(directory: str):
 
 def new_lookup_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def _publish_or_replace(directory: str, name: str, text: str) -> None:
+    """Write one episode file. A new name appears only when the bytes are complete."""
+    data = text.encode("utf-8")
+    path = os.path.join(directory, name)
+    if not os.path.lexists(path):
+        publish.create_complete_file(directory, name, data)
+        return
+    publish.replace_exclusive_file(directory, name, data, publish.read_exclusive(path))
 
 
 def _write(path: str, text: str, *, append: bool = False) -> None:
@@ -173,6 +184,8 @@ def _rewrite_tree(directory: str, episode_id: str, deadline: str) -> None:
             if not os.path.islink(os.path.join(dirpath, name))
         ]
         for name in filenames:
+            if name.endswith(".replacing") or name.endswith(".cleanup-tmp"):
+                continue
             path = os.path.join(dirpath, name)
             if not os.path.islink(path):
                 files.append(path)
@@ -183,11 +196,51 @@ def _rewrite_tree(directory: str, episode_id: str, deadline: str) -> None:
             _rewrite_json(path, episode_id, deadline)
 
 
+def _json_episode_ids(node: object) -> set[str]:
+    found: set[str] = set()
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            episode_id = value.get("episode_id")
+            if isinstance(episode_id, str) and episode_id.strip():
+                found.add(episode_id)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(node)
+    return found
+
+
+def _line_episode_ids(data: object) -> set[str]:
+    found: set[str] = set()
+    if not isinstance(data, dict):
+        return found
+    episode_id = data.get("episode_id")
+    if isinstance(episode_id, str) and episode_id.strip():
+        found.add(episode_id)
+    nested = data.get("episode")
+    if isinstance(nested, dict):
+        inner = nested.get("episode_id")
+        if isinstance(inner, str) and inner.strip():
+            found.add(inner)
+    return found
+
+
 def _rewrite_jsonl(path: str, episode_id: str, deadline: str) -> None:
-    with open(path, encoding="utf-8") as handle:
-        raw_lines = handle.readlines()
+    try:
+        original = publish.read_exclusive(path)
+    except (OSError, publish.PublishError) as exc:
+        raise retention.RetentionRejected(
+            "refusing to rewrite a linked or unreadable log"
+        ) from exc
+    raw_lines = original.decode("utf-8").splitlines(keepends=True)
     changed = False
     output: list[str] = []
+    owners: set[str] = set()
+    ownerless = False
     for raw in raw_lines:
         stripped = raw.strip()
         if not stripped:
@@ -197,32 +250,56 @@ def _rewrite_jsonl(path: str, episode_id: str, deadline: str) -> None:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
             raise retention.RetentionRejected(
-                "unreadable records file blocks persistence; refusing to ignore its deadline"
+                "unreadable records file blocks persistence; refusing to rewrite a shared log"
             ) from exc
-        if isinstance(data, dict) and retention.mentions_episode(data, episode_id):
+        ids = _line_episode_ids(data)
+        if len(ids) != 1:
+            ownerless = True
+            output.append(raw if raw.endswith("\n") else raw + "\n")
+            continue
+        owners.add(next(iter(ids)))
+        if next(iter(ids)) == episode_id:
             updated = retention.rewrite_expires_at(data, deadline)
             if updated != data:
                 changed = True
             output.append(json.dumps(updated, sort_keys=True) + "\n")
         else:
             output.append(raw if raw.endswith("\n") else raw + "\n")
+    if episode_id not in owners:
+        return
+    if ownerless or owners != {episode_id}:
+        raise retention.RetentionRejected(
+            "refusing to rewrite a log shared with another episode or an ownerless line"
+        )
     if changed:
-        _write(path, "".join(output))
+        publish.replace_exclusive_file(
+            os.path.dirname(path), os.path.basename(path), "".join(output).encode(), original,
+        )
 
 
 def _rewrite_json(path: str, episode_id: str, deadline: str) -> None:
     try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except json.JSONDecodeError as exc:
+        original = publish.read_exclusive(path)
+        data = json.loads(original.decode("utf-8"))
+    except (OSError, json.JSONDecodeError, publish.PublishError) as exc:
         raise retention.RetentionRejected(
             "unreadable records file blocks persistence; refusing to ignore its deadline"
         ) from exc
-    if not retention.mentions_episode(data, episode_id):
+    ids = _json_episode_ids(data)
+    if episode_id not in ids:
         return
+    if ids != {episode_id}:
+        raise retention.RetentionRejected(
+            "refusing to rewrite a JSON file shared by more than one episode"
+        )
     updated = retention.rewrite_expires_at(data, deadline)
     if updated != data:
-        _write(path, json.dumps(updated, indent=2, sort_keys=True) + "\n")
+        publish.replace_exclusive_file(
+            os.path.dirname(path),
+            os.path.basename(path),
+            (json.dumps(updated, indent=2, sort_keys=True) + "\n").encode(),
+            original,
+        )
 
 
 def _values_for_episode(data: object, episode_id: str, key: str) -> list[str]:
@@ -356,24 +433,30 @@ def log_event(
             auth.expires_at,
         )
     try:
-        deadline = _deadline_for_write(directory, episode_id, auth.expires_at, clock)
-        _ensure_dir(directory)
-        _rewrite_tree(directory, episode_id, deadline)
-        event = {
-            "episode_id": episode_id,
-            "outcome": outcome,
-            "reason": reason,
-            "adapter": adapter,
-            "expires_at": deadline,
-            "lane": "disconnected_mock",
-            "live_linkage": "blocked",
-        }
-        _write(
-            os.path.join(directory, "research-log.jsonl"),
-            json.dumps(event, sort_keys=True) + "\n",
-            append=True,
-        )
-    except retention.RetentionRejected as exc:
+        if not episode_id.strip():
+            raise retention.RetentionRejected(
+                "episode id is required; refusing a shared research log"
+            )
+        _guard_directory(directory)
+        with _store_lock(directory):
+            publish.recover_staged_replacements(directory)
+            deadline = _deadline_for_write(directory, episode_id, auth.expires_at, clock)
+            _rewrite_tree(directory, episode_id, deadline)
+            event = {
+                "episode_id": episode_id,
+                "outcome": outcome,
+                "reason": reason,
+                "adapter": adapter,
+                "expires_at": deadline,
+                "lane": "disconnected_mock",
+                "live_linkage": "blocked",
+            }
+            episode_dir = os.path.join(directory, "episodes", _slug(episode_id))
+            _ensure_dir(episode_dir)
+            _publish_or_replace(
+                episode_dir, "research.jsonl", json.dumps(event, sort_keys=True) + "\n",
+            )
+    except (retention.RetentionRejected, publish.PublishError) as exc:
         return _blocked(str(exc))
     return {
         "persisted": True,
@@ -404,16 +487,24 @@ def store_result(
         )
     episode_id = str(payload.get("episode", {}).get("episode_id", ""))
     try:
-        deadline = _deadline_for_write(directory, episode_id, auth.expires_at, clock, packet=payload)
-        results = os.path.join(directory, "results")
-        _ensure_dir(results)
-        _rewrite_tree(directory, episode_id, deadline)
-        clean = retention.rewrite_expires_at(retention.redact_identifying_contacts(payload), deadline)
-        clean["expires_at"] = deadline
-        name = _slug(episode_id or "result") + ".json"
-        path = os.path.join(results, name)
-        _write(path, json.dumps(clean, indent=2, sort_keys=True) + "\n")
-    except retention.RetentionRejected as exc:
+        if not episode_id.strip():
+            raise retention.RetentionRejected(
+                "episode id is required; refusing a shared result file"
+            )
+        _guard_directory(directory)
+        with _store_lock(directory):
+            publish.recover_staged_replacements(directory)
+            deadline = _deadline_for_write(
+                directory, episode_id, auth.expires_at, clock, packet=payload,
+            )
+            _rewrite_tree(directory, episode_id, deadline)
+            clean = retention.rewrite_expires_at(retention.redact_identifying_contacts(payload), deadline)
+            clean["expires_at"] = deadline
+            results = os.path.join(directory, "results")
+            _ensure_dir(results)
+            name = _slug(episode_id) + ".json"
+            _publish_or_replace(results, name, json.dumps(clean, indent=2, sort_keys=True) + "\n")
+    except (retention.RetentionRejected, publish.PublishError) as exc:
         return _blocked(str(exc))
     return {
         "persisted": True,
@@ -435,8 +526,8 @@ def persist_bundle(
     """Write the offline packet, result, query log, and research log together.
 
     Re-ingestion cannot move an episode's deadline later. A shorter deadline
-    is written onto the new files and onto every earlier derivative for that
-    episode. Symlinks are not followed. No identifying hash is written.
+    is written onto that episode's own files. A shared log is not rewritten.
+    Symlinks are not followed. No identifying hash is written.
     """
     try:
         if not isinstance(deadline, datetime) or deadline.tzinfo is None or deadline.tzinfo.utcoffset(deadline) is None:
@@ -455,6 +546,7 @@ def persist_bundle(
             os.makedirs(directory, mode=0o700)
         _guard_directory(directory)
         with _store_lock(directory):
+            publish.recover_staged_replacements(directory)
             iso = _deadline_for_write(
                 directory, episode, deadline, now, packet=packet, policy=policy,
                 first_collected_at=origin,
@@ -473,16 +565,12 @@ def persist_bundle(
             slug = _slug(episode or "episode")
             packets = os.path.join(directory, "packets")
             results = os.path.join(directory, "results")
+            episode_dir = os.path.join(directory, "episodes", slug)
             _ensure_dir(packets)
             _ensure_dir(results)
-            _write(
-                os.path.join(packets, f"handoff-{slug}.json"),
-                json.dumps(clean, indent=2, sort_keys=True) + "\n",
-            )
-            _write(
-                os.path.join(results, f"{slug}.json"),
-                json.dumps(clean, indent=2, sort_keys=True) + "\n",
-            )
+            _ensure_dir(episode_dir)
+            _publish_or_replace(packets, f"handoff-{slug}.json", json.dumps(clean, indent=2, sort_keys=True) + "\n")
+            _publish_or_replace(results, f"{slug}.json", json.dumps(clean, indent=2, sort_keys=True) + "\n")
             log_line = {
                 "episode_id": episode,
                 "outcome": clean.get("consistency", {}).get("status"),
@@ -493,11 +581,6 @@ def persist_bundle(
             }
             if isinstance(origin, str):
                 log_line["first_collected_at"] = origin
-            _write(
-                os.path.join(directory, "research-log.jsonl"),
-                json.dumps(log_line, sort_keys=True) + "\n",
-                append=True,
-            )
             query_line = {
                 "episode_id": episode,
                 "expires_at": iso,
@@ -506,12 +589,9 @@ def persist_bundle(
             }
             if isinstance(origin, str):
                 query_line["first_collected_at"] = origin
-            _write(
-                os.path.join(directory, "query-log.jsonl"),
-                json.dumps(query_line, sort_keys=True) + "\n",
-                append=True,
-            )
-    except retention.RetentionRejected as exc:
+            _publish_or_replace(episode_dir, "research.jsonl", json.dumps(log_line, sort_keys=True) + "\n")
+            _publish_or_replace(episode_dir, "query.jsonl", json.dumps(query_line, sort_keys=True) + "\n")
+    except (retention.RetentionRejected, publish.PublishError) as exc:
         return {
             "persisted": False,
             "live_linkage": "blocked",

@@ -530,6 +530,15 @@ def _is_hash_sidecar(base: str) -> bool:
     )
 
 
+def _numbered_episode_log(folded: str, stem: str) -> bool:
+    prefix = stem + "."
+    suffix = ".jsonl"
+    if not folded.startswith(prefix) or not folded.endswith(suffix):
+        return False
+    middle = folded[len(prefix):-len(suffix)]
+    return middle.isdigit() and not middle.startswith("0")
+
+
 def classify_artifact(relative_path: str) -> list[str]:
     """Return catalog kinds that apply to one relative path."""
     rel = relative_path.replace("\\", "/")
@@ -545,11 +554,20 @@ def classify_artifact(relative_path: str) -> list[str]:
 
     if folded == "synthetic-store.json":
         add("synthetic_store_marker")
-    if folded in {"query-log.jsonl", "query_log.jsonl"} or folded.endswith(".query.jsonl"):
+    if (
+        folded in {"query-log.jsonl", "query_log.jsonl", "query.jsonl"}
+        or folded.endswith(".query.jsonl")
+        or _numbered_episode_log(folded, "query")
+    ):
         add("query_log")
     if folded in {"audit-events.jsonl", "audit_events.jsonl"} or "audit" in folded:
         add("audit_log")
-    if folded.startswith("research-log") or folded.startswith("research_log"):
+    if (
+        folded in {"research.jsonl"}
+        or folded.startswith("research-log")
+        or folded.startswith("research_log")
+        or _numbered_episode_log(folded, "research")
+    ):
         add("research_log")
         add("audit_log")
     if parent == "results" and folded.endswith(".json") and "relative" not in folded:

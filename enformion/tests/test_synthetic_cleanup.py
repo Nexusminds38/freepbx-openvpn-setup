@@ -106,9 +106,12 @@ class SyntheticCleanupTests(unittest.TestCase):
             self.assertNotEqual(expired_id, retained_id)
             slug = retention.episode_slug(expired_id)
             _write(
-                os.path.join(tmp, "backups", "research-log.jsonl.bak"),
-                json.dumps({"episode_id": expired_id, "expires_at": "2026-11-10T00:00:00+00:00"}) + "\n"
-                + json.dumps({"episode_id": retained_id, "expires_at": "2026-11-20T15:00:00-05:00"}) + "\n",
+                os.path.join(tmp, "backups", "expired.jsonl"),
+                json.dumps({"episode_id": expired_id, "expires_at": "2026-11-10T00:00:00+00:00"}) + "\n",
+            )
+            _write(
+                os.path.join(tmp, "backups", "retained.jsonl"),
+                json.dumps({"episode_id": retained_id, "expires_at": "2026-11-20T15:00:00-05:00"}) + "\n",
             )
             _write(os.path.join(tmp, "results", slug + ".sha256"), "synthetic-sidecar\n")
             offset_id = "county=example county|source=https://example.org/fictional-roster|booking=bk-fiction-offset"
@@ -150,22 +153,21 @@ class SyntheticCleanupTests(unittest.TestCase):
             self.assertTrue(applied["applied"])
             self.assertFalse(applied["partial_failure"])
             self.assertGreater(applied["counts"]["removed_files"], 0)
-            self.assertEqual(applied["counts"]["removed_log_lines"], 0)
-            self.assertEqual(applied["counts"]["removed_sidecars"], 0)
-            self.assertGreater(applied["counts"]["mixed_files"], 0)
+            self.assertGreater(applied["counts"]["removed_log_lines"], 0)
+            self.assertEqual(applied["counts"]["removed_sidecars"], 1)
             self.assertLess(applied["counts"]["files_after"], applied["counts"]["files_before"])
             after = _snapshot(tmp)
-            self.assertIn("results/" + slug + ".sha256", after)
-            self.assertFalse(any(name.endswith(".cleanup-tmp") for name in after))
+            self.assertNotIn("results/" + slug + ".sha256", after)
+            self.assertFalse(any(name.endswith(".cleanup-tmp") or name.endswith(".replacing") for name in after))
             self.assertIn("synthetic-store.json", after)
             self.assertIn(os.path.relpath(naive_path, tmp), after)
             combined = "\n".join(text.decode() for text in after.values())
             self.assertIn(retained_id, combined)
             self.assertIn(hold_id, combined)
             self.assertIn("orphan-line", combined)
-            self.assertIn(expired_id, combined)
+            self.assertNotIn(expired_id, combined)
             self.assertNotIn(offset_id, combined)
-            self.assertIn("synthetic-sidecar", combined)
+            self.assertNotIn("synthetic-sidecar", combined)
             self.assertFalse(applied["retention_compliance_claimed"])
             self.assertIn("Roster-watch", " ".join(applied["out_of_scope_stores"]))
 
