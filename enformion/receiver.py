@@ -91,7 +91,21 @@ def receive(
             "expires_at": None,
             "synthetic": True,
         }
-    auth = retention.authorize(policy, packet.get("expires_at"), now=now)
+    working = packet
+    if retention.policy_is_owner_23h(policy):
+        try:
+            working = retention.apply_owner_cap(packet, now=now)
+        except retention.RetentionRejected as exc:
+            return {
+                "accepted_offline": False,
+                "persisted": False,
+                "live_linkage": "blocked",
+                "production_destination": None,
+                "reason": str(exc),
+                "expires_at": None,
+                "synthetic": True,
+            }
+    auth = retention.authorize(policy, working.get("expires_at"), now=now)
     receipt = {
         "accepted_offline": True,
         "persisted": False,
@@ -104,7 +118,7 @@ def receive(
     if not auth.allowed or auth.expires_at is None:
         return receipt
     try:
-        earliest, stamped = _reconcile_deadlines(packet, now=now)
+        earliest, stamped = _reconcile_deadlines(working, now=now)
     except retention.RetentionRejected as exc:
         receipt["accepted_offline"] = False
         receipt["expires_at"] = None
@@ -117,7 +131,9 @@ def receive(
             "records directory is not configured; persistence blocked; live linkage blocked"
         )
         return receipt
-    stored = audit.persist_bundle(records_directory, packet, earliest, now=now)
+    stored = audit.persist_bundle(
+        records_directory, working, earliest, now=now, policy=policy,
+    )
     if not stored.get("persisted"):
         receipt["accepted_offline"] = False
         receipt["persisted"] = False

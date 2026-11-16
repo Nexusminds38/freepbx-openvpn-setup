@@ -11,6 +11,8 @@ import json
 import os
 import sys
 
+import retention
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Show the offline research log.")
@@ -24,17 +26,26 @@ def main(argv: list[str] | None = None) -> int:
             "No default store was opened."
         )
         return 0
-    log_path = os.path.join(directory, "research-log.jsonl")
-    if not os.path.isfile(log_path):
+    events = []
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+        for name in sorted(filenames):
+            folded = name.casefold()
+            if folded.endswith(".replacing"):
+                continue
+            if folded not in {"research.jsonl", "research-log.jsonl"} and not retention._numbered_episode_log(folded, "research"):
+                continue
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                continue
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        events.append(json.loads(line))
+    if not events:
         print("No lookups logged in the configured directory.")
         return 0
-
-    events = []
-    with open(log_path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                events.append(json.loads(line))
     shown = events[-args.last:]
     print(f"Research log: {len(events)} event(s) in the configured directory.")
     for event in shown:

@@ -6,6 +6,17 @@ explicit ``explicit_expires_at`` policy is present. This module does not
 choose a retention duration. It does not follow symlinks, write hashes, or
 leave an identifying tombstone.
 
+Cleanup never rewrites a file and never creates a temporary copy. A file is
+unlinked only when every record in it belongs to an expired episode. A log
+or backup that also holds a record that must stay is left untouched, and
+that blocks deletion of the expired episode's other files too.
+
+The directory lock is advisory and is taken by this program's own writer
+and cleanup. It does not stop a process that writes the store without the
+lock. That case is unsupported. A change noticed before unlink cancels the
+deletion. A change after that check is still possible for a noncooperating
+writer; this code does not claim that gap is closed.
+
 A fixture test of this module is not proof that production stores were deleted.
 """
 
@@ -16,6 +27,7 @@ import os
 import stat
 from datetime import datetime
 
+import publish
 import retention
 
 MARKER_NAME = "synthetic-store.json"
@@ -96,15 +108,20 @@ def apply_synthetic_cleanup(
     must be ``synthetic-test-store``. Missing policy, a duration field, a
     symlink, a hardlink, or an unparseable record blocks deletion.
     """
-    report = _build_report(root, now=now, policy=policy)
-    report["applied"] = False
     if not apply:
+        report = _build_report(root, now=now, policy=policy)
+        report["applied"] = False
         report["reason"] = "dry-run default; no bytes were deleted"
         report["counts"]["files_after"] = report["counts"]["files_before"]
         return _public(report)
+    report = _empty_report(now, policy)
+    report["applied"] = False
+    contained, blockers, seen = _containment(root)
+    report["containment_blockers"] = blockers
+    report["counts"]["files_before"] = seen
+    report["counts"]["files_after"] = seen
     if confirm != SYNTHETIC_APPLY_CONFIRMATION:
         report["reason"] = "synthetic cleanup confirmation is required; no bytes were deleted"
-        report["counts"]["files_after"] = report["counts"]["files_before"]
         report["live_linkage"] = "blocked"
         return _public(report)
     if not retention.policy_is_explicit(policy):
@@ -112,20 +129,17 @@ def apply_synthetic_cleanup(
             "explicit expires_at policy is required before cleanup; "
             "no retention duration is configured"
         )
-        report["counts"]["files_after"] = report["counts"]["files_before"]
         report["live_linkage"] = "blocked"
         return _public(report)
-    if report["containment_blockers"] or report["store_blockers"]:
+    if not contained:
         report["reason"] = "cleanup blocked; no bytes were deleted"
-        report["counts"]["files_after"] = report["counts"]["files_before"]
         report["live_linkage"] = "blocked"
         return _public(report)
     if not _marker_is_synthetic(root):
         report["reason"] = "cleanup apply is limited to a marked synthetic store"
-        report["counts"]["files_after"] = report["counts"]["files_before"]
         report["live_linkage"] = "blocked"
         return _public(report)
-    return _apply(root, now, report)
+    return _apply(root, now, policy)
 
 
 def _build_report(root: str, *, now: datetime, policy: object) -> dict:
@@ -174,9 +188,11 @@ def _empty_report(now: datetime, policy: object) -> dict:
             "malformed_deadline_records": 0,
             "ambiguous_records": 0,
             "unknown_files": 0,
+            "transaction_artifacts": 0,
             "conflicting_deadline_records": 0,
             "eligible_files": 0,
             "eligible_log_lines": 0,
+            "mixed_files": 0,
             "eligible_sidecars": 0,
             "removed_files": 0,
             "removed_log_lines": 0,
@@ -289,9 +305,10 @@ def _deadline_state(node: object) -> tuple[str, datetime | None]:
         if deadline is None:
             return "malformed", None
         parsed.append(deadline)
+    earliest = min(parsed)
     if len(set(parsed)) != 1:
-        return "conflict", None
-    return "aware", parsed[0]
+        return "conflict", earliest
+    return "aware", earliest
 
 
 def _classify_store(root: str, now: datetime, report: dict) -> None:
@@ -301,6 +318,7 @@ def _classify_store(root: str, now: datetime, report: dict) -> None:
     line_units: list[dict] = []
     sidecars: list[dict] = []
     slug_owner: dict[str, str] = {}
+    report["_files"] = {}
 
     def episode(episode_id: str) -> dict:
         row = episodes.get(episode_id)
@@ -326,6 +344,22 @@ def _classify_store(root: str, now: datetime, report: dict) -> None:
             counts["files_before"] += 1
             if name == MARKER_NAME and dirpath == root:
                 continue
+            if name.endswith(".cleanup-tmp"):
+                counts["transaction_artifacts"] += 1
+                sibling = path[: -len(".cleanup-tmp")]
+                info = os.lstat(path)
+                if (
+                    stat.S_ISREG(info.st_mode)
+                    and info.st_nlink == 1
+                    and os.path.isfile(sibling)
+                    and not os.path.islink(sibling)
+                ):
+                    report.setdefault("_temps", []).append(path)
+                else:
+                    report["store_blockers"].append(
+                        "cleanup temp has no canonical file; refusing to guess"
+                    )
+                continue
             if retention.is_hash_sidecar(path):
                 sidecars.append({"path": path, "relative": relative, "name": name})
                 continue
@@ -346,11 +380,8 @@ def _classify_store(root: str, now: datetime, report: dict) -> None:
             counts["blocked_episodes"] += 1
             continue
         if len(instants) != 1:
-            row["blocked"] = True
-            counts["blocked_episodes"] += 1
             counts["conflicting_deadline_records"] += 1
-            continue
-        earliest = next(iter(instants))
+        earliest = min(instants)
         if earliest <= now:
             expired.add(episode_id)
             counts["expired_episodes"] += 1
@@ -358,13 +389,7 @@ def _classify_store(root: str, now: datetime, report: dict) -> None:
             counts["retained_episodes"] += 1
 
     report["_expired"] = expired
-    report["_file_units"] = [
-        unit for unit in file_units if unit["episode_id"] in expired and not episodes[unit["episode_id"]]["blocked"]
-    ]
-    report["_line_units"] = {}
-    for unit in line_units:
-        if unit["episode_id"] in expired and not episodes[unit["episode_id"]]["blocked"]:
-            report["_line_units"].setdefault(unit["path"], set()).add(unit["line_index"])
+    report["_unlink"] = _exclusive_expired_files(report["_files"], episodes, expired, counts)
     tied_sidecars = []
     for sidecar in sidecars:
         owner = _sidecar_owner(sidecar["name"], slug_owner)
@@ -373,41 +398,98 @@ def _classify_store(root: str, now: datetime, report: dict) -> None:
             report["store_blockers"].append("untied identifying sidecar blocks cleanup")
             continue
         row = episodes.get(owner)
-        if row is None or row["blocked"] or owner not in expired:
+        if row is None or row["blocked"] or row.get("mixed") or owner not in expired:
             continue
         tied_sidecars.append(sidecar)
     report["_sidecars"] = tied_sidecars
-    counts["eligible_files"] = len(report["_file_units"])
-    counts["eligible_log_lines"] = sum(len(lines) for lines in report["_line_units"].values())
+    counts["eligible_files"] = len(report["_unlink"])
+    counts["eligible_log_lines"] = sum(item["lines"] for item in report["_unlink"])
     counts["eligible_sidecars"] = len(tied_sidecars)
     counts["files_after"] = counts["files_before"]
+
+
+def _note_file(report: dict, path: str, kind: str, episode_id: str | None, keep: bool) -> dict:
+    entry = report["_files"].setdefault(
+        path, {"keep": False, "episodes": set(), "lines": 0, "kind": kind}
+    )
+    if keep:
+        entry["keep"] = True
+    if episode_id:
+        entry["episodes"].add(episode_id)
+    return entry
+
+
+def _exclusive_expired_files(files: dict, episodes: dict, expired: set[str], counts: dict) -> list[dict]:
+    """Whole files whose every record belongs to an expired episode.
+
+    A file that also holds a retained, blocked, or ownerless record is not
+    rewritten. Expired episodes in that file are marked mixed so their other
+    files stay too.
+    """
+    for entry in files.values():
+        if entry["keep"] or not entry["episodes"]:
+            for episode_id in entry["episodes"]:
+                if episode_id in expired:
+                    episodes[episode_id]["mixed"] = True
+            if entry["keep"] and entry["episodes"]:
+                counts["mixed_files"] += 1
+            continue
+        if any(episode_id not in expired or episodes[episode_id]["blocked"] for episode_id in entry["episodes"]):
+            counts["mixed_files"] += 1
+            for episode_id in entry["episodes"]:
+                if episode_id in expired:
+                    episodes[episode_id]["mixed"] = True
+            continue
+        entry["exclusive"] = True
+    for entry in files.values():
+        if entry.get("exclusive") and any(
+            episodes[episode_id].get("mixed") or episodes[episode_id]["blocked"]
+            for episode_id in entry["episodes"]
+        ):
+            entry["exclusive"] = False
+            for episode_id in entry["episodes"]:
+                episodes[episode_id]["mixed"] = True
+    return [
+        {"path": path, "lines": entry["lines"] if entry["kind"] == "jsonl" else 0}
+        for path, entry in files.items()
+        if entry.get("exclusive")
+    ]
 
 
 def _take_json(path: str, relative: str, episode, file_units: list, report: dict) -> None:
     counts = report["counts"]
     try:
-        data = json.loads(_read_text_nofollow(path))
+        text = _read_text_nofollow(path)
+        data = json.loads(text)
     except (OSError, json.JSONDecodeError):
         counts["malformed_deadline_records"] += 1
         report["store_blockers"].append("unreadable file blocks cleanup")
         return
     ids = _episode_ids(data)
     state, deadline = _deadline_state(data)
-    if len(ids) != 1 or state != "aware" or deadline is None:
+    entry = _note_file(report, path, "json", None, keep=False)
+    entry["text"] = text
+    if len(ids) != 1 or state in {"missing", "malformed"} or deadline is None:
+        entry["keep"] = True
         _count_bad(state if len(ids) == 1 else "ambiguous", counts)
         if len(ids) == 1:
             episode(next(iter(ids)))["blocked"] = True
+            entry["episodes"].add(next(iter(ids)))
         return
+    if state == "conflict":
+        counts["conflicting_deadline_records"] += 1
     episode_id = next(iter(ids))
     row = episode(episode_id)
     row["deadlines"].append(deadline)
+    entry["episodes"].add(episode_id)
     file_units.append({"path": path, "relative": relative, "episode_id": episode_id})
 
 
 def _take_jsonl(path: str, relative: str, episode, line_units: list, report: dict) -> None:
     counts = report["counts"]
     try:
-        raw_lines = _read_text_nofollow(path).splitlines(keepends=True)
+        text = _read_text_nofollow(path)
+        raw_lines = text.splitlines(keepends=True)
     except OSError:
         counts["malformed_deadline_records"] += 1
         report["store_blockers"].append("unreadable file blocks cleanup")
@@ -423,17 +505,25 @@ def _take_jsonl(path: str, relative: str, episode, line_units: list, report: dic
             counts["malformed_deadline_records"] += 1
             report["store_blockers"].append("unreadable log line blocks cleanup")
             return
+    entry = _note_file(report, path, "jsonl", None, keep=False)
+    entry["text"] = text
     for index, data in parsed:
         ids = _episode_ids(data)
         state, deadline = _deadline_state(data)
-        if len(ids) != 1 or state != "aware" or deadline is None:
+        entry["lines"] += 1
+        if len(ids) != 1 or state in {"missing", "malformed"} or deadline is None:
+            entry["keep"] = True
             _count_bad(state if len(ids) == 1 else "ambiguous", counts)
             if len(ids) == 1:
                 episode(next(iter(ids)))["blocked"] = True
+                entry["episodes"].add(next(iter(ids)))
             continue
+        if state == "conflict":
+            counts["conflicting_deadline_records"] += 1
         episode_id = next(iter(ids))
         row = episode(episode_id)
         row["deadlines"].append(deadline)
+        entry["episodes"].add(episode_id)
         line_units.append({"path": path, "relative": relative, "line_index": index, "episode_id": episode_id})
 
 
@@ -472,23 +562,59 @@ def _sidecar_owner(name: str, slug_owner: dict[str, str]) -> str | None:
     return None
 
 
-def _apply(root: str, now: datetime, report: dict) -> dict:
+def _apply(root: str, now: datetime, policy: object) -> dict:
+    report = _empty_report(now, policy)
     counts = report["counts"]
     removed_files = 0
     removed_lines = 0
     removed_sidecars = 0
     try:
-        for path, indexes in sorted(report["_line_units"].items()):
-            removed_lines += _drop_lines(root, path, indexes, now)
-        for unit in report["_file_units"]:
-            _unlink_contained(root, unit["path"])
-            removed_files += 1
-        for sidecar in report["_sidecars"]:
-            _unlink_contained(root, sidecar["path"])
-            removed_sidecars += 1
-            removed_files += 1
-        _remove_empty_dirs(root)
+        import audit
+        with audit._store_lock(root):
+            publish.recover_staged_replacements(root)
+            report = _build_report(root, now=now, policy=policy)
+            counts = report["counts"]
+            if report["containment_blockers"] or report["store_blockers"]:
+                report["applied"] = False
+                report["reason"] = "cleanup blocked; no bytes were deleted"
+                report["counts"]["files_after"] = report["counts"]["files_before"]
+                report["live_linkage"] = "blocked"
+                return _public(report)
+            for item in report.get("_unlink", []):
+                current = _read_text_nofollow(item["path"])
+                if current != report["_files"][item["path"]].get("text"):
+                    raise OSError("file changed before unlink")
+            for path in report.get("_temps", []):
+                checkpoint("unlink:" + os.path.relpath(path, root))
+                _unlink_contained(root, path)
+                removed_files += 1
+            for item in report.get("_unlink", []):
+                checkpoint("unlink:" + os.path.relpath(item["path"], root))
+                _unlink_contained(root, item["path"])
+                removed_files += 1
+                removed_lines += item["lines"]
+            for sidecar in report.get("_sidecars", []):
+                checkpoint("unlink:" + os.path.relpath(sidecar["path"], root))
+                _unlink_contained(root, sidecar["path"])
+                removed_sidecars += 1
+                removed_files += 1
+            _remove_empty_dirs(root)
+    except publish.PublishError as exc:
+        report["partial_failure"] = False
+        report["applied"] = False
+        report["reason"] = str(exc)
+        report["live_linkage"] = "blocked"
+        report["retention_compliance_claimed"] = False
+        return _public(report)
     except OSError:
+        if removed_files == 0 and removed_lines == 0 and removed_sidecars == 0:
+            report["partial_failure"] = False
+            report["applied"] = False
+            report["reason"] = "file changed before unlink; no records were deleted"
+            counts["files_after"] = counts["files_before"]
+            report["live_linkage"] = "blocked"
+            report["retention_compliance_claimed"] = False
+            return _public(report)
         report["partial_failure"] = True
         report["applied"] = True
         report["reason"] = "cleanup stopped after a partial failure; no tombstone was written"
@@ -504,46 +630,19 @@ def _apply(root: str, now: datetime, report: dict) -> dict:
     counts["removed_sidecars"] = removed_sidecars
     counts["files_after"] = _count_files(root)
     report["applied"] = True
-    report["reason"] = "synthetic cleanup applied; production deletion is not claimed"
+    if counts["mixed_files"] or counts["blocked_episodes"] or counts["unknown_files"]:
+        report["reason"] = (
+            "exclusive expired files were unlinked; shared or blocked records remain "
+            "and retention compliance is not claimed"
+        )
+    else:
+        report["reason"] = (
+            "exclusive expired files in this directory were unlinked; "
+            "retention compliance is not claimed for copies outside it"
+        )
     report["live_linkage"] = "blocked"
     report["retention_compliance_claimed"] = False
     return _public(report)
-
-
-def _drop_lines(root: str, path: str, indexes: set[int], now: datetime) -> int:
-    _require_exclusive_file(root, path)
-    raw_lines = _read_text_nofollow(path).splitlines(keepends=True)
-    if any(index < 0 or index >= len(raw_lines) for index in indexes):
-        raise OSError("log changed before cleanup")
-    kept: list[str] = []
-    removed = 0
-    for index, raw in enumerate(raw_lines):
-        if index not in indexes:
-            kept.append(raw if raw.endswith("\n") or raw == "" else raw + "\n")
-            continue
-        try:
-            data = json.loads(raw.strip())
-        except json.JSONDecodeError as exc:
-            raise OSError("log line changed before cleanup") from exc
-        state, deadline = _deadline_state(data)
-        ids = _episode_ids(data)
-        if state != "aware" or deadline is None or deadline > now or len(ids) != 1:
-            raise OSError("log line is no longer an expired episode")
-        removed += 1
-    _require_exclusive_file(root, path)
-    temporary = path + ".cleanup-tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, 0o600)
-    try:
-        os.write(descriptor, "".join(kept).encode())
-    finally:
-        os.close(descriptor)
-    try:
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    return removed
 
 
 def _require_exclusive_file(root: str, path: str) -> None:
@@ -562,11 +661,30 @@ def _unlink_contained(root: str, path: str) -> None:
     os.unlink(path)
 
 
+def _recover_transaction_files(root: str) -> int:
+    """Delete leftover cleanup temp files. Do not read their contents."""
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+        for name in filenames:
+            if not name.endswith(".cleanup-tmp"):
+                continue
+            path = os.path.join(dirpath, name)
+            _unlink_contained(root, path)
+            removed += 1
+    return removed
+
+
 def _remove_empty_dirs(root: str) -> None:
-    for name in ("results", "packets", "backups", "queue"):
-        path = os.path.join(root, name)
-        if os.path.isdir(path) and not os.path.islink(path) and not os.listdir(path):
-            os.rmdir(path)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        if dirpath == root or os.path.islink(dirpath):
+            continue
+        dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+        if not dirnames and not filenames:
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
 
 
 def _count_files(root: str) -> int:
@@ -577,6 +695,147 @@ def _count_files(root: str) -> int:
     return total
 
 
+FAULT_AFTER: str | None = None
+
+
+def checkpoint(name: str) -> None:
+    """Test seam. A fault is an injected crash, not a retention decision."""
+    if FAULT_AFTER == name:
+        raise RuntimeError(f"injected fault after {name}")
+
+
+def migrate_mixed_logs(root: str, *, confirm: str = "") -> dict:
+    """Split legacy mixed logs into per-episode files, then unlink the mixed file.
+
+    A line is copied with ``linkat`` only after its bytes are complete. The
+    mixed file is removed only after every line is present in its episode
+    file and the mixed file is unchanged. Ownerless or unreadable lines stop
+    the migration and the mixed file stays. Compliance is not claimed while
+    it remains.
+    """
+    report = {
+        "applied": False,
+        "migration_complete": False,
+        "live_linkage": "blocked",
+        "production_destination": None,
+        "retention_compliance_claimed": False,
+        "files_unlinked": [],
+        "reason": "",
+    }
+    if confirm != SYNTHETIC_APPLY_CONFIRMATION:
+        report["reason"] = "synthetic migration confirmation is required"
+        return report
+    if not _marker_is_synthetic(root):
+        report["reason"] = "migration is limited to a marked synthetic store"
+        return report
+    contained, blockers, _seen = _containment(root)
+    if not contained:
+        report["reason"] = "migration blocked by symlink, hardlink, or path escape"
+        report["containment_blockers"] = blockers
+        return report
+    try:
+        import audit
+        with audit._store_lock(root):
+            publish.recover_staged_replacements(root)
+            mixed = _mixed_log_paths(root)
+            if not mixed:
+                report["applied"] = True
+                report["migration_complete"] = True
+                report["reason"] = "no mixed logs remain"
+                return report
+            for path in mixed:
+                if not _migrate_one_log(root, path, report):
+                    report["reason"] = (
+                        "mixed log was not removed; expired data may remain "
+                        "and retention compliance is not claimed"
+                    )
+                    return report
+    except (OSError, publish.PublishError, RuntimeError) as exc:
+        report["reason"] = str(exc)
+        return report
+    report["applied"] = True
+    report["migration_complete"] = True
+    report["reason"] = "mixed logs were split into per-episode files"
+    return report
+
+
+def _mixed_log_paths(root: str) -> list[str]:
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path) or _record_kind(path) != "jsonl":
+                continue
+            if _log_is_mixed(path):
+                found.append(path)
+    return found
+
+
+def _log_is_mixed(path: str) -> bool:
+    try:
+        raw = publish.read_exclusive(path)
+    except (OSError, publish.PublishError):
+        return True
+    episodes: set[str] = set()
+    for line in raw.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            return True
+        ids = _episode_ids(data)
+        if len(ids) != 1:
+            return True
+        episodes.add(next(iter(ids)))
+    return len(episodes) > 1
+
+
+def _migrate_one_log(root: str, path: str, report: dict) -> bool:
+    original = publish.read_exclusive(path)
+    grouped: dict[str, list[bytes]] = {}
+    for line in original.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        ids = _episode_ids(data)
+        if len(ids) != 1:
+            return False
+        episode_id = next(iter(ids))
+        grouped.setdefault(episode_id, []).append((line + "\n").encode())
+    stem = "query" if os.path.basename(path).casefold().startswith("query") else "research"
+    for episode_id, lines in grouped.items():
+        slug = retention.episode_slug(episode_id)
+        directory = os.path.join(root, "episodes", slug)
+        _publish_copied_lines(directory, stem, b"".join(lines))
+        checkpoint(f"published:{slug}")
+    if publish.read_exclusive(path) != original:
+        return False
+    os.unlink(path)
+    publish._fsync_directory(os.path.dirname(path))
+    report["files_unlinked"].append(os.path.relpath(path, root))
+    checkpoint(f"unlinked:{os.path.relpath(path, root)}")
+    return True
+
+
+def _publish_copied_lines(directory: str, stem: str, desired: bytes) -> None:
+    """Copy one episode's original lines into a new file. Never replace a different file."""
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    for index in range(1, 1000):
+        name = f"{stem}.jsonl" if index == 1 else f"{stem}.{index}.jsonl"
+        path = os.path.join(directory, name)
+        if not os.path.lexists(path):
+            publish.create_complete_file(directory, name, desired)
+            return
+        if publish.read_exclusive(path) == desired:
+            return
+    raise publish.PublishError("no unused per-episode log name")
+
+
 def _strip_private(report: dict) -> None:
-    for key in ("_expired", "_file_units", "_line_units", "_sidecars"):
+    for key in ("_expired", "_file_units", "_line_units", "_sidecars", "_files", "_unlink", "_temps"):
         report.pop(key, None)

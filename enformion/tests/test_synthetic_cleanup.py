@@ -106,9 +106,12 @@ class SyntheticCleanupTests(unittest.TestCase):
             self.assertNotEqual(expired_id, retained_id)
             slug = retention.episode_slug(expired_id)
             _write(
-                os.path.join(tmp, "backups", "research-log.jsonl.bak"),
-                json.dumps({"episode_id": expired_id, "expires_at": "2026-11-10T00:00:00+00:00"}) + "\n"
-                + json.dumps({"episode_id": retained_id, "expires_at": "2026-11-20T15:00:00-05:00"}) + "\n",
+                os.path.join(tmp, "backups", "expired.jsonl"),
+                json.dumps({"episode_id": expired_id, "expires_at": "2026-11-10T00:00:00+00:00"}) + "\n",
+            )
+            _write(
+                os.path.join(tmp, "backups", "retained.jsonl"),
+                json.dumps({"episode_id": retained_id, "expires_at": "2026-11-20T15:00:00-05:00"}) + "\n",
             )
             _write(os.path.join(tmp, "results", slug + ".sha256"), "synthetic-sidecar\n")
             offset_id = "county=example county|source=https://example.org/fictional-roster|booking=bk-fiction-offset"
@@ -155,6 +158,7 @@ class SyntheticCleanupTests(unittest.TestCase):
             self.assertLess(applied["counts"]["files_after"], applied["counts"]["files_before"])
             after = _snapshot(tmp)
             self.assertNotIn("results/" + slug + ".sha256", after)
+            self.assertFalse(any(name.endswith(".cleanup-tmp") or name.endswith(".replacing") for name in after))
             self.assertIn("synthetic-store.json", after)
             self.assertIn(os.path.relpath(naive_path, tmp), after)
             combined = "\n".join(text.decode() for text in after.values())
